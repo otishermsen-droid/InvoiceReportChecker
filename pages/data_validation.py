@@ -20,7 +20,6 @@ df = st.session_state.df
 
 # Sidebar parameters
 st.sidebar.header("Parameters")
-coexist_tol = st.sidebar.number_input("DDP/%Tax tolerance", min_value=0.0, value=0.01, step=0.01)
 
 with st.sidebar.expander("Optional BigQuery context (NOT used by AI)"):
     brand = st.text_input("Brand", value="SC")
@@ -30,14 +29,14 @@ with st.sidebar.expander("Optional BigQuery context (NOT used by AI)"):
 
 # Run checks
 cogs_mism = sanity_check_cogs(df.copy())
-ddp_tax_mism = sanity_checks_ddp_tax(df.copy(), tol=coexist_tol)
+ddp_tax_mism = sanity_checks_ddp_tax(df.copy())
 gmv_mism = sanity_check_gmv(df.copy())
 
 # Save for Assistant page
 st.session_state.cogs_mism = cogs_mism
 st.session_state.ddp_tax_mism = ddp_tax_mism
 st.session_state.gmv_mism = gmv_mism
-st.session_state.tols = {"coexist_tol": coexist_tol}
+st.session_state.tols = {}
 
 st.markdown("## Validation Results")
 
@@ -47,36 +46,62 @@ gmv_pass = len(gmv_mism) == 0
 
 col1, col2 = st.columns(2)
 with col1:
-    st.markdown("#### COGS check")
+    st.markdown("#### COGS check ")
+    with st.expander("Show COGS calculation info"):
+        st.info("""
+**COGS Calculation:**  
+COGS is checked as:  
+`COGS ≈ GMV Net VAT - TLG Fee - DDP Services`  
+Rows are flagged if the calculated COGS does not match the expected value (within the removed tolerance).
+""", icon="ℹ️")
     st.markdown(f"**{'PASSED ✅' if cogs_pass else 'NOT PASSED ❌'}**")
     st.write(f"Mismatches: **{len(cogs_mism)}**")
-    st.dataframe(cogs_mism.head(50), use_container_width=True)
+    cogs_cols = ["Order Number", "Product ID", "COGS", "GMV Net VAT", "TLG Fee", "DDP Services", "expected_cogs", "delta"]
+    cogs_display = cogs_mism[[col for col in cogs_cols if col in cogs_mism.columns]]
+    st.dataframe(cogs_display.head(50), use_container_width=True)
     st.download_button(
         "Download COGS mismatches CSV",
-        data=cogs_mism.to_csv(index=False).encode("utf-8-sig"),
+        data=cogs_display.to_csv(index=False).encode("utf-8-sig"),
         file_name="cogs_mismatches.csv",
         mime="text/csv",
     )
 
 with col2:
     st.markdown("#### DDP/%Tax coexistence check")
+    with st.expander("Show DDP/%Tax calculation info"):
+        st.info("""
+**DDP/%Tax Coexistence Calculation:**  
+Rows are flagged if both `% Tax` and `DDP Services` are greater than the specified tolerance.  
+This checks for cases where both are present, which may indicate a data issue.
+""", icon="ℹ️")
     st.markdown(f"**{'PASSED ✅' if ddp_pass else 'NOT PASSED ❌'}**")
     st.write(f"Mismatches: **{len(ddp_tax_mism)}**")
-    st.dataframe(ddp_tax_mism.head(50), use_container_width=True)
+    ddp_cols = ["Order Number", "Product ID", "% Tax", "DDP Services"]
+    ddp_display = ddp_tax_mism[[col for col in ddp_cols if col in ddp_tax_mism.columns]]
+    st.dataframe(ddp_display.head(50), use_container_width=True)
     st.download_button(
         "Download DDP/Tax mismatches CSV",
-        data=ddp_tax_mism.to_csv(index=False).encode("utf-8-sig"),
+        data=ddp_display.to_csv(index=False).encode("utf-8-sig"),
         file_name="ddp_tax_mismatches.csv",
         mime="text/csv",
     )
 
 st.markdown("#### GMV check (Sell Price - Discount - DDP Services vs GMV EUR)")
+with st.expander("Show GMV calculation info"):
+    st.info("""
+**GMV Calculation:**  
+GMV is checked as:  
+`GMV EUR ≈ Sell Price - Discount - DDP Services`  
+Rows are flagged if the calculated GMV does not match the expected value (within the removed tolerance).
+""", icon="ℹ️")
 st.markdown(f"**{'PASSED ✅' if gmv_pass else 'NOT PASSED ❌'}**")
 st.write(f"Mismatches: **{len(gmv_mism)}**")
-st.dataframe(gmv_mism.head(50), use_container_width=True)
+gmv_cols = ["Order Number", "Product ID", "Sell Price", "Discount", "DDP Services", "GMV EUR", "expected_gmv", "delta"]
+gmv_display = gmv_mism[[col for col in gmv_cols if col in gmv_mism.columns]]
+st.dataframe(gmv_display.head(50), use_container_width=True)
 st.download_button(
     "Download GMV mismatches CSV",
-    data=gmv_mism.to_csv(index=False).encode("utf-8-sig"),
+    data=gmv_display.to_csv(index=False).encode("utf-8-sig"),
     file_name="gmv_mismatches.csv",
     mime="text/csv",
 )

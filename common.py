@@ -44,7 +44,7 @@ def load_invoicing_report(file: io.BytesIO | str) -> pd.DataFrame:
         "Type", "Numero Fattura / Nota di Credito", "Data Fattura", "Shipping Country",
         "Currency", "% Tax", "Original Price", "Sell Price", "Discount", "DDP Services",
         "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2",
-        "Qualità Reso.", "__extra__"
+        "Qualità Reso.","Matricolari","__extra__"
     ]
     file.seek(0)
     df = pd.read_csv(
