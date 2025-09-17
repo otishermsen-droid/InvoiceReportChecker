@@ -3,7 +3,7 @@ import os
 import io
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import pandas as pd
 from google.cloud import bigquery
@@ -93,6 +93,47 @@ def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) 
     mismatches = df.loc[~df["cogs_match"]].copy()
     mismatches["delta"] = df["COGS"] - df["expected_cogs"]
     return mismatches
+
+
+def auto_fix_cogs(
+    df: pd.DataFrame, mismatches: pd.DataFrame | None = None
+) -> Tuple[pd.DataFrame, int]:
+    """Fix COGS and COGS2 values for the provided mismatches.
+
+    Parameters
+    ----------
+    df:
+        The full invoicing dataframe.
+    mismatches:
+        Optional dataframe returned by :func:`sanity_check_cogs`. When omitted the
+        function recomputes the mismatches internally.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, int]
+        A copy of the input dataframe with corrected values and the number of
+        rows updated.
+    """
+
+    if mismatches is None:
+        mismatches = sanity_check_cogs(df.copy())
+
+    if mismatches.empty:
+        return df.copy(), 0
+
+    updated_df = df.copy()
+    index_to_fix = mismatches.index.intersection(updated_df.index)
+    if len(index_to_fix) == 0:
+        return updated_df, 0
+
+    expected = mismatches.loc[index_to_fix, "expected_cogs"]
+    updated_df.loc[index_to_fix, "COGS"] = expected
+
+    if "COGS2" in updated_df.columns:
+        updated_df.loc[index_to_fix, "COGS2"] = expected
+
+    logging.info("Auto-fixed COGS for %d rows.", len(index_to_fix))
+    return updated_df, len(index_to_fix)
 
 
 def sanity_checks_ddp_tax(df: pd.DataFrame, tol: float = 0.01) -> pd.DataFrame:
