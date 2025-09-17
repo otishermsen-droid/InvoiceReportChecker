@@ -6,6 +6,7 @@ from common import (
     sanity_checks_ddp_tax,
     sanity_check_gmv,
     fetch_orders_returns,
+    auto_fix_cogs,
 )
 
 st.set_page_config(page_title="Raw File Data Validation", layout="wide")
@@ -17,6 +18,9 @@ if "df" not in st.session_state or st.session_state.df is None:
     st.stop()
 
 df = st.session_state.df
+
+if "cogs_fix_feedback" not in st.session_state:
+    st.session_state.cogs_fix_feedback = None
 
 # Sidebar parameters
 st.sidebar.header("Parameters")
@@ -49,22 +53,49 @@ with col1:
     st.markdown("#### COGS check ")
     with st.expander("Show COGS calculation info"):
         st.info("""
-**COGS Calculation:**  
-COGS is checked as:  
-`COGS ≈ GMV Net VAT - TLG Fee - DDP Services`  
+**COGS Calculation:**
+COGS is checked as:
+`COGS ≈ GMV Net VAT - TLG Fee - DDP Services`
 Rows are flagged if the calculated COGS does not match the expected value (within the removed tolerance).
 """, icon="ℹ️")
     st.markdown(f"**{'PASSED ✅' if cogs_pass else 'NOT PASSED ❌'}**")
     st.write(f"Mismatches: **{len(cogs_mism)}**")
+    feedback = st.session_state.get("cogs_fix_feedback")
+    if feedback is not None:
+        rows_fixed = feedback.get("rows", 0)
+        if feedback.get("status") == "success":
+            st.success(
+                f"Auto-fixed {rows_fixed} row{'s' if rows_fixed != 1 else ''}."
+            )
+        else:
+            st.info("No COGS mismatches were available to fix.")
+        st.session_state.cogs_fix_feedback = None
     cogs_cols = ["Order Number", "Product ID", "COGS", "GMV Net VAT", "TLG Fee", "DDP Services", "expected_cogs", "delta"]
     cogs_display = cogs_mism[[col for col in cogs_cols if col in cogs_mism.columns]]
+    action_cols = st.columns(2)
+    with action_cols[1]:
+        fix_btn = st.button(
+            "Auto-fix COGS mismatches",
+            type="primary",
+            disabled=cogs_pass,
+            use_container_width=True,
+        )
+    if fix_btn:
+        updated_df, rows_fixed = auto_fix_cogs(st.session_state.df, cogs_mism)
+        st.session_state.df = updated_df
+        st.session_state.cogs_fix_feedback = {
+            "status": "success" if rows_fixed else "info",
+            "rows": rows_fixed,
+        }
+        st.experimental_rerun()
+    with action_cols[0]:
+        st.download_button(
+            "Download COGS mismatches CSV",
+            data=cogs_display.to_csv(index=False).encode("utf-8-sig"),
+            file_name="cogs_mismatches.csv",
+            mime="text/csv",
+        )
     st.dataframe(cogs_display.head(50), use_container_width=True)
-    st.download_button(
-        "Download COGS mismatches CSV",
-        data=cogs_display.to_csv(index=False).encode("utf-8-sig"),
-        file_name="cogs_mismatches.csv",
-        mime="text/csv",
-    )
 
 with col2:
     st.markdown("#### DDP/%Tax coexistence check")
