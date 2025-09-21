@@ -3,7 +3,7 @@ import os
 import io
 import logging
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Union
 
 import pandas as pd
 from google.cloud import bigquery
@@ -36,7 +36,7 @@ def _coerce_numeric(df: pd.DataFrame, cols) -> pd.DataFrame:
     return df
 
 
-def load_invoicing_report(file: io.BytesIO | str) -> pd.DataFrame:
+def load_invoicing_report(file: Union[io.BytesIO, str]) -> pd.DataFrame:
     import csv
     headers = [
         "StoreID", "Export Date", "Transaction ID", "Date", "Row ID",
@@ -44,7 +44,7 @@ def load_invoicing_report(file: io.BytesIO | str) -> pd.DataFrame:
         "Type", "Numero Fattura / Nota di Credito", "Data Fattura", "Shipping Country",
         "Currency", "% Tax", "Original Price", "Sell Price", "Discount", "DDP Services",
         "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2",
-        "Qualità Reso.","Matricolari","__extra__"
+        "Qualità Reso.", "Matricolari", "__extra__"
     ]
     file.seek(0)
     df = pd.read_csv(
@@ -72,8 +72,8 @@ def load_invoicing_report(file: io.BytesIO | str) -> pd.DataFrame:
             df[dcol] = pd.to_datetime(df[dcol], errors="coerce", dayfirst=True)
 
     num_cols = [
-        "Qty","COGS","% Tax","Original Price","Sell Price","Discount","DDP Services",
-        "Exchange rate","GMV EUR","GMV Net VAT","% TLG FEE","TLG Fee","COGS2"
+        "Qty", "COGS", "% Tax", "Original Price", "Sell Price", "Discount", "DDP Services",
+        "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2"
     ]
     df = _coerce_numeric(df, num_cols)
     return df
@@ -96,7 +96,7 @@ def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) 
 
 
 def auto_fix_cogs(
-    df: pd.DataFrame, mismatches: pd.DataFrame | None = None
+    df: pd.DataFrame, mismatches: Union[pd.DataFrame, None] = None
 ) -> Tuple[pd.DataFrame, int]:
     """Fix COGS and COGS2 values for the provided mismatches.
 
@@ -176,7 +176,8 @@ def sanity_check_tlg_fee(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
     abs_ok = diff <= atol
     df["tlg_fee_match"] = rel_ok | abs_ok
     mismatches = df.loc[~df["tlg_fee_match"]].copy()
-    mismatches["delta"] = df["TLG Fee"] - df["expected_tlg_fee"]
+    mismatches["delta"] = mismatches["TLG Fee"] - \
+        mismatches["expected_tlg_fee"]
     return mismatches
 
 

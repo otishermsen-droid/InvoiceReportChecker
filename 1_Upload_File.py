@@ -10,7 +10,6 @@ st.markdown(
     "Use the **pages** on the left: 1) Upload here, 2) Validate data, 3) Ask the assistant."
 )
 
-
 # Initialize session state holders once
 if "df" not in st.session_state:
     st.session_state.df = None

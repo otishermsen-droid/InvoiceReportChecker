@@ -21,3 +21,5 @@ tornado.websocket.WebSocketClosedError
 2025-09-17 16:35:31,411 - INFO: Auto-fixed COGS for 277 rows.
 2025-09-17 16:38:40,692 - INFO: Auto-fixed COGS for 16 rows.
 2025-09-17 16:40:42,439 - INFO: Auto-fixed COGS for 293 rows.
+2025-09-21 20:34:04,809 - INFO: HTTP Request: POST https://api.openai.com/v1/embeddings "HTTP/1.1 401 Unauthorized"
+2025-09-21 20:40:08,887 - INFO: HTTP Request: POST https://api.openai.com/v1/embeddings "HTTP/1.1 401 Unauthorized"
