@@ -7,22 +7,43 @@ from common import (
     sanity_check_gmv,
     fetch_orders_returns,
     auto_fix_cogs,
+    sanity_check_tlg_fee,
+    load_invoicing_report,
 )
 
 st.set_page_config(page_title="Raw File Data Validation", layout="wide")
 st.title("File Data Validation")
 
-# Require data
+# ────────────────────────────────────────────────────────────────────────────────
+# Require data and persist uploaded file
+# ────────────────────────────────────────────────────────────────────────────────
 if "df" not in st.session_state or st.session_state.df is None:
-    st.warning("No CSV loaded yet. Go back to **Home** and upload a file.")
-    st.stop()
+    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+    if uploaded_file is not None:
+        df = load_invoicing_report(uploaded_file)
+        st.session_state.df = df
+        st.session_state.uploaded_file = uploaded_file.getvalue()
+    else:
+        st.warning("No CSV loaded yet. Go back to **Home** and upload a file.")
+        st.stop()
+else:
+    # If file is not in memory but was uploaded before, reload it
+    if "uploaded_file" in st.session_state and st.session_state.df is None:
+        from io import BytesIO
 
-df = st.session_state.df
+        df = load_invoicing_report(BytesIO(st.session_state.uploaded_file))
+        st.session_state.df = df
+    else:
+        df = st.session_state.df
 
 if "cogs_fix_feedback" not in st.session_state:
     st.session_state.cogs_fix_feedback = None
+if "tlg_fee_fix_feedback" not in st.session_state:
+    st.session_state.tlg_fee_fix_feedback = None
 
+# ────────────────────────────────────────────────────────────────────────────────
 # Sidebar parameters
+# ────────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("Parameters")
 
 with st.sidebar.expander("Optional BigQuery context (NOT used by AI)"):
@@ -31,8 +52,16 @@ with st.sidebar.expander("Optional BigQuery context (NOT used by AI)"):
     end_date = st.text_input("End date (YYYY-MM-DD)", value="2025-08-31")
     fetch_bq = st.checkbox("Fetch BQ orders/returns for context", value=False)
 
+# ────────────────────────────────────────────────────────────────────────────────
 # Run checks
-cogs_mism = sanity_check_cogs(df.copy())
+# ────────────────────────────────────────────────────────────────────────────────
+COGS_ATOL = 1e-6
+COGS_RTOL = 1e-6
+TLG_ATOL = 1e-6
+TLG_RTOL = 1e-6
+
+tlg_fee_mism = sanity_check_tlg_fee(df.copy(), atol=TLG_ATOL, rtol=TLG_RTOL)
+cogs_mism = sanity_check_cogs(df.copy(), atol=COGS_ATOL, rtol=COGS_RTOL)
 ddp_tax_mism = sanity_checks_ddp_tax(df.copy())
 gmv_mism = sanity_check_gmv(df.copy())
 
@@ -47,31 +76,167 @@ st.markdown("## Validation Results")
 cogs_pass = len(cogs_mism) == 0
 ddp_pass = len(ddp_tax_mism) == 0
 gmv_pass = len(gmv_mism) == 0
+tlg_pass = len(tlg_fee_mism) == 0
 
-col1, col2 = st.columns(2)
+col0, col1 = st.columns(2)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# TLG FEE check (before COGS check)
+# ────────────────────────────────────────────────────────────────────────────────
+with col0:
+    st.markdown("#### TLG FEE calculation check")
+    with st.expander("Show TLG FEE calculation info"):
+        st.info(
+            """
+**TLG FEE Calculation:**
+TLG FEE is checked as:
+`TLG Fee ≈ GMV Net VAT * (% TLG FEE / 100)`
+Rows are flagged if the calculated TLG Fee does not match the expected value (within a small tolerance).
+""",
+            icon="ℹ️",
+        )
+
+    tlg_cols = [
+        "Order Number",
+        "Product ID",
+        "TLG Fee",
+        "GMV Net VAT",
+        "% TLG FEE",
+        "expected_tlg_fee",
+        "delta",
+    ]
+    tlg_display = tlg_fee_mism[[c for c in tlg_cols if c in tlg_fee_mism.columns]]
+
+    st.markdown(f"**{'PASSED ✅' if tlg_pass else 'NOT PASSED ❌'}**")
+    st.write(f"Mismatches: **{len(tlg_fee_mism)}**")
+
+    # Show previous fix feedback (if any)
+    tlg_feedback = st.session_state.get("tlg_fee_fix_feedback")
+    if tlg_feedback is not None:
+        rows_fixed = tlg_feedback.get("rows", 0)
+        if tlg_feedback.get("status") == "success":
+            st.success(f"Auto-fixed {rows_fixed} row{'s' if rows_fixed != 1 else ''}.")
+        elif tlg_feedback.get("status") == "info":
+            st.info("No TLG FEE mismatches were available to fix.")
+        elif tlg_feedback.get("status") == "warning":
+            st.warning(tlg_feedback.get("message", "Some rows could not be fixed."))
+        st.session_state.tlg_fee_fix_feedback = None
+
+    action_cols_tlg = st.columns(2)
+    with action_cols_tlg[1]:
+        fix_tlg_btn = st.button(
+            "Auto-fix TLG FEE mismatches",
+            type="primary",
+            disabled=len(tlg_fee_mism) == 0,
+            use_container_width=True,
+        )
+if fix_tlg_btn:
+    try:
+        updated_df = st.session_state.df.copy()
+        key_cols = [c for c in ["Order Number", "Product ID"] if c in updated_df.columns]
+
+        if key_cols:
+            # 1) Collect candidate fixes
+            fixes = tlg_fee_mism.loc[
+                tlg_fee_mism["expected_tlg_fee"].notna(), key_cols + ["expected_tlg_fee"]
+            ].copy()
+
+            if not fixes.empty:
+                # 2) If the same key has multiple different expected values, note it and pick the first
+                conflict_counts = (
+                    fixes.groupby(key_cols)["expected_tlg_fee"].nunique().reset_index(name="n")
+                )
+                n_conflicts = int((conflict_counts["n"] > 1).sum())
+
+                fixes_agg = (
+                    fixes.groupby(key_cols)["expected_tlg_fee"]
+                    .first()                # choose a canonical value per key
+                    .reset_index()
+                )
+
+                # 3) Merge to update ALL matching rows (handles duplicate keys)
+                merged = updated_df.merge(fixes_agg, on=key_cols, how="left", suffixes=("", "_fix"))
+                mask = merged["expected_tlg_fee"].notna()
+                merged.loc[mask, "TLG Fee"] = merged.loc[mask, "expected_tlg_fee"]
+
+                # 4) Clean up + enforce numeric dtype
+                merged = merged.drop(columns=["expected_tlg_fee"])
+                if "TLG Fee" in merged.columns:
+                    merged["TLG Fee"] = pd.to_numeric(merged["TLG Fee"], errors="coerce")
+
+                st.session_state.df = merged
+                st.session_state.tlg_fee_fix_feedback = {
+                    "status": "success",
+                    "rows": int(mask.sum()),
+                    **({"message": f"{n_conflicts} key(s) had conflicting expected fees; the first value was used."} if n_conflicts else {}),
+                }
+            else:
+                st.session_state.tlg_fee_fix_feedback = {"status": "info", "rows": 0}
+        else:
+            st.session_state.tlg_fee_fix_feedback = {
+                "status": "warning",
+                "rows": 0,
+                "message": "Missing key columns to apply fixes (need at least 'Order Number' and 'Product ID').",
+            }
+    except Exception as e:
+        st.session_state.tlg_fee_fix_feedback = {
+            "status": "warning",
+            "rows": 0,
+            "message": f"TLG auto-fix failed: {e}",
+        }
+
+    st.rerun()
+
+
+    with action_cols_tlg[0]:
+        st.download_button(
+            "Download TLG FEE mismatches CSV",
+            data=tlg_display.to_csv(index=False).encode("utf-8-sig"),
+            file_name="tlg_fee_mismatches.csv",
+            mime="text/csv",
+        )
+    if not tlg_display.empty:
+        st.dataframe(tlg_display.head(50), use_container_width=True)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# COGS check
+# ────────────────────────────────────────────────────────────────────────────────
 with col1:
     st.markdown("#### COGS check ")
     with st.expander("Show COGS calculation info"):
-        st.info("""
+        st.info(
+            """
 **COGS Calculation:**
 COGS is checked as:
 `COGS ≈ GMV Net VAT - TLG Fee - DDP Services`
 Rows are flagged if the calculated COGS does not match the expected value (within the removed tolerance).
-""", icon="ℹ️")
+""",
+            icon="ℹ️",
+        )
     st.markdown(f"**{'PASSED ✅' if cogs_pass else 'NOT PASSED ❌'}**")
     st.write(f"Mismatches: **{len(cogs_mism)}**")
+
     feedback = st.session_state.get("cogs_fix_feedback")
     if feedback is not None:
         rows_fixed = feedback.get("rows", 0)
         if feedback.get("status") == "success":
-            st.success(
-                f"Auto-fixed {rows_fixed} row{'s' if rows_fixed != 1 else ''}."
-            )
+            st.success(f"Auto-fixed {rows_fixed} row{'s' if rows_fixed != 1 else ''}.")
         else:
             st.info("No COGS mismatches were available to fix.")
         st.session_state.cogs_fix_feedback = None
-    cogs_cols = ["Order Number", "Product ID", "COGS", "GMV Net VAT", "TLG Fee", "DDP Services", "expected_cogs", "delta"]
-    cogs_display = cogs_mism[[col for col in cogs_cols if col in cogs_mism.columns]]
+
+    cogs_cols = [
+        "Order Number",
+        "Product ID",
+        "COGS",
+        "GMV Net VAT",
+        "TLG Fee",
+        "DDP Services",
+        "expected_cogs",
+        "delta",
+    ]
+    cogs_display = cogs_mism[[c for c in cogs_cols if c in cogs_mism.columns]]
+
     action_cols = st.columns(2)
     with action_cols[1]:
         fix_btn = st.button(
@@ -87,7 +252,8 @@ Rows are flagged if the calculated COGS does not match the expected value (withi
             "status": "success" if rows_fixed else "info",
             "rows": rows_fixed,
         }
-        st.experimental_rerun()
+        st.rerun()
+
     with action_cols[0]:
         st.download_button(
             "Download COGS mismatches CSV",
@@ -95,21 +261,31 @@ Rows are flagged if the calculated COGS does not match the expected value (withi
             file_name="cogs_mismatches.csv",
             mime="text/csv",
         )
-    st.dataframe(cogs_display.head(50), use_container_width=True)
+    if not cogs_display.empty:
+        st.dataframe(cogs_display.head(50), use_container_width=True)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# DDP/%Tax coexistence & GMV checks
+# ────────────────────────────────────────────────────────────────────────────────
+col2, col3 = st.columns(2)
 
 with col2:
     st.markdown("#### DDP/%Tax coexistence check")
     with st.expander("Show DDP/%Tax calculation info"):
-        st.info("""
+        st.info(
+            """
 **DDP/%Tax Coexistence Calculation:**  
 Rows are flagged if both `% Tax` and `DDP Services` are greater than the specified tolerance.  
 This checks for cases where both are present, which may indicate a data issue.
-""", icon="ℹ️")
+""",
+            icon="ℹ️",
+        )
     st.markdown(f"**{'PASSED ✅' if ddp_pass else 'NOT PASSED ❌'}**")
     st.write(f"Mismatches: **{len(ddp_tax_mism)}**")
     ddp_cols = ["Order Number", "Product ID", "% Tax", "DDP Services"]
-    ddp_display = ddp_tax_mism[[col for col in ddp_cols if col in ddp_tax_mism.columns]]
-    st.dataframe(ddp_display.head(50), use_container_width=True)
+    ddp_display = ddp_tax_mism[[c for c in ddp_cols if c in ddp_tax_mism.columns]]
+    if not ddp_display.empty:
+        st.dataframe(ddp_display.head(50), use_container_width=True)
     st.download_button(
         "Download DDP/Tax mismatches CSV",
         data=ddp_display.to_csv(index=False).encode("utf-8-sig"),
@@ -117,27 +293,46 @@ This checks for cases where both are present, which may indicate a data issue.
         mime="text/csv",
     )
 
-st.markdown("#### GMV check (Sell Price - Discount - DDP Services vs GMV EUR)")
-with st.expander("Show GMV calculation info"):
-    st.info("""
+with col3:
+    st.markdown("#### GMV check (Sell Price - Discount - DDP Services vs GMV EUR)")
+    with st.expander("Show GMV calculation info"):
+        st.info(
+            """
 **GMV Calculation:**  
 GMV is checked as:  
 `GMV EUR ≈ Sell Price - Discount - DDP Services`  
 Rows are flagged if the calculated GMV does not match the expected value (within the removed tolerance).
-""", icon="ℹ️")
-st.markdown(f"**{'PASSED ✅' if gmv_pass else 'NOT PASSED ❌'}**")
-st.write(f"Mismatches: **{len(gmv_mism)}**")
-gmv_cols = ["Order Number", "Product ID", "Sell Price", "Discount", "DDP Services", "GMV EUR", "expected_gmv", "delta"]
-gmv_display = gmv_mism[[col for col in gmv_cols if col in gmv_mism.columns]]
-st.dataframe(gmv_display.head(50), use_container_width=True)
-st.download_button(
-    "Download GMV mismatches CSV",
-    data=gmv_display.to_csv(index=False).encode("utf-8-sig"),
-    file_name="gmv_mismatches.csv",
-    mime="text/csv",
-)
+""",
+            icon="ℹ️",
+        )
+    st.markdown(f"**{'PASSED ✅' if gmv_pass else 'NOT PASSED ❌'}**")
+    st.write(f"Mismatches: **{len(gmv_mism)}**")
+    gmv_cols = [
+        "Order Number",
+        "Product ID",
+        "Sell Price",
+        "Discount",
+        "DDP Services",
+        "GMV EUR",
+        "expected_gmv",
+        "delta",
+    ]
+    gmv_display = gmv_mism[[c for c in gmv_cols if c in gmv_mism.columns]]
+    if not gmv_display.empty:
+        st.dataframe(gmv_display.head(50), use_container_width=True)
+        st.download_button(
+            "Download GMV mismatches CSV",
+            data=gmv_display.to_csv(index=False).encode("utf-8-sig"),
+            file_name="gmv_mismatches.csv",
+            mime="text/csv",
+        )
 
+# ────────────────────────────────────────────────────────────────────────────────
 # Optional BQ context
+# ────────────────────────────────────────────────────────────────────────────────
+if 'fetch_bq' not in locals():
+    fetch_bq = False
+
 if fetch_bq:
     with st.spinner("Fetching BQ data (context only)..."):
         try:
@@ -146,3 +341,27 @@ if fetch_bq:
             st.dataframe(bq_df.head(20), use_container_width=True)
         except Exception as e:
             st.error(f"BQ fetch failed: {e}")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Download updated dataframe (bottom of sidebar)
+# ────────────────────────────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.download_button(
+    label="⬇️ Download updated CSV",
+    data=st.session_state.df.to_csv(index=False).encode("utf-8-sig"),
+    file_name="updated_dataframe.csv",
+    mime="text/csv",
+)
+
+# Summary below download button
+total_rows = len(st.session_state.df)
+updated_rows = 0
+feedback = st.session_state.get("cogs_fix_feedback")
+if feedback is not None:
+    updated_rows = feedback.get("rows", 0)
+tlg_fb = st.session_state.get("tlg_fee_fix_feedback")
+if tlg_fb is not None:
+    updated_rows = updated_rows + int(tlg_fb.get("rows", 0))
+
+st.sidebar.markdown(f"**Total rows in CSV:** {total_rows}")
+st.sidebar.markdown(f"**Rows updated in CSV:** {updated_rows}")

@@ -80,12 +80,12 @@ def load_invoicing_report(file: io.BytesIO | str) -> pd.DataFrame:
 
 
 def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
-    req = ["COGS", "GMV Net VAT", "TLG Fee", "DDP Services"]
+    req = ["COGS", "GMV Net VAT", "TLG Fee"]
     missing = [c for c in req if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
     _coerce_numeric(df, req)
-    df["expected_cogs"] = df["GMV Net VAT"] - df["TLG Fee"] - df["DDP Services"]
+    df["expected_cogs"] = df["GMV Net VAT"] - df["TLG Fee"]
     diff = (df["COGS"] - df["expected_cogs"]).abs()
     rel_ok = diff <= (df["expected_cogs"].abs() * rtol).fillna(0)
     abs_ok = diff <= atol
@@ -159,6 +159,24 @@ def sanity_check_gmv(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -
     df["gmv_match"] = rel_ok | abs_ok
     mismatches = df.loc[~df["gmv_match"]].copy()
     mismatches["delta"] = df["GMV EUR"] - df["expected_gmv"]
+    return mismatches
+
+
+def sanity_check_tlg_fee(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
+    req = ["TLG Fee", "GMV Net VAT", "% TLG FEE"]
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    _coerce_numeric(df, req)
+    # Avoid division by zero and NaN
+    percent = df["% TLG FEE"].replace(0, pd.NA)
+    df["expected_tlg_fee"] = (df["GMV Net VAT"] * (percent / 100)).round(2)
+    diff = (df["TLG Fee"] - df["expected_tlg_fee"]).abs()
+    rel_ok = diff <= (df["expected_tlg_fee"].abs() * rtol).fillna(0)
+    abs_ok = diff <= atol
+    df["tlg_fee_match"] = rel_ok | abs_ok
+    mismatches = df.loc[~df["tlg_fee_match"]].copy()
+    mismatches["delta"] = df["TLG Fee"] - df["expected_tlg_fee"]
     return mismatches
 
 
