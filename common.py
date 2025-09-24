@@ -78,90 +78,6 @@ def load_invoicing_report(file: Union[io.BytesIO, str]) -> pd.DataFrame:
     df = _coerce_numeric(df, num_cols)
     return df
 
-
-def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
-    req = ["COGS", "GMV Net VAT", "TLG Fee"]
-    missing = [c for c in req if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-    _coerce_numeric(df, req)
-    df["expected_cogs"] = df["GMV Net VAT"] - df["TLG Fee"]
-    diff = (df["COGS"] - df["expected_cogs"]).abs()
-    rel_ok = diff <= (df["expected_cogs"].abs() * rtol).fillna(0)
-    abs_ok = diff <= atol
-    df["cogs_match"] = rel_ok | abs_ok
-    mismatches = df.loc[~df["cogs_match"]].copy()
-    mismatches["delta"] = df["COGS"] - df["expected_cogs"]
-    return mismatches
-
-
-def auto_fix_cogs(
-    df: pd.DataFrame, mismatches: Union[pd.DataFrame, None] = None
-) -> Tuple[pd.DataFrame, int]:
-    """Fix COGS and COGS2 values for the provided mismatches.
-
-    Parameters
-    ----------
-    df:
-        The full invoicing dataframe.
-    mismatches:
-        Optional dataframe returned by :func:`sanity_check_cogs`. When omitted the
-        function recomputes the mismatches internally.
-
-    Returns
-    -------
-    tuple[pd.DataFrame, int]
-        A copy of the input dataframe with corrected values and the number of
-        rows updated.
-    """
-
-    if mismatches is None:
-        mismatches = sanity_check_cogs(df.copy())
-
-    if mismatches.empty:
-        return df.copy(), 0
-
-    updated_df = df.copy()
-    index_to_fix = mismatches.index.intersection(updated_df.index)
-    if len(index_to_fix) == 0:
-        return updated_df, 0
-
-    expected = mismatches.loc[index_to_fix, "expected_cogs"]
-    updated_df.loc[index_to_fix, "COGS"] = expected
-
-    if "COGS2" in updated_df.columns:
-        updated_df.loc[index_to_fix, "COGS2"] = expected
-
-    logging.info("Auto-fixed COGS for %d rows.", len(index_to_fix))
-    return updated_df, len(index_to_fix)
-
-
-def sanity_checks_ddp_tax(df: pd.DataFrame, tol: float = 0.01) -> pd.DataFrame:
-    req = ["% Tax", "DDP Services"]
-    missing = [c for c in req if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-    _coerce_numeric(df, req)
-    mismatches = df[(df["% Tax"] > tol) & (df["DDP Services"] > tol)].copy()
-    return mismatches
-
-
-def sanity_check_gmv(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
-    req = ["Sell Price", "Discount", "DDP Services", "GMV EUR"]
-    missing = [c for c in req if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-    _coerce_numeric(df, req)
-    df["expected_gmv"] = df["Sell Price"] - df["Discount"] - df["DDP Services"]
-    diff = (df["GMV EUR"] - df["expected_gmv"]).abs()
-    rel_ok = diff <= (df["expected_gmv"].abs() * rtol).fillna(0)
-    abs_ok = diff <= atol
-    df["gmv_match"] = rel_ok | abs_ok
-    mismatches = df.loc[~df["gmv_match"]].copy()
-    mismatches["delta"] = df["GMV EUR"] - df["expected_gmv"]
-    return mismatches
-
-
 def sanity_check_tlg_fee(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
     req = ["TLG Fee", "GMV Net VAT", "% TLG FEE"]
     missing = [c for c in req if c not in df.columns]
@@ -180,6 +96,81 @@ def sanity_check_tlg_fee(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
         mismatches["expected_tlg_fee"]
     return mismatches
 
+def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
+    # COGS ≈ GMV Net VAT - TLG Fee
+    req = ["COGS", "GMV Net VAT", "TLG Fee"]
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    _coerce_numeric(df, req) 
+
+    # Compute expectations
+    df["expected_cogs"] = df["GMV Net VAT"] - df["TLG Fee"]
+
+    # Safe numeric diff
+    diff = (df["COGS"] - df["expected_cogs"]).abs()
+
+    # Build tolerance checks (these produce nullable booleans if NaNs exist)
+    rel_ok = diff <= (df["expected_cogs"].abs() * rtol)
+    abs_ok = diff <= atol
+
+    # Collapse NA to False so the mask is pure bool
+    df["cogs_match"] = (rel_ok.fillna(False) | abs_ok.fillna(False))
+
+    # Now select mismatches with a solid bool mask
+    mismatches = df.loc[~df["cogs_match"]].copy()
+
+    # Compute delta inside the subset (avoids weird cross-alignment surprises)
+    mismatches["delta"] = mismatches["COGS"] - mismatches["expected_cogs"]
+
+    return mismatches
+
+
+def sanity_checks_ddp_tax(df: pd.DataFrame, tol: float = 0.01) -> pd.DataFrame:
+    req = ["% Tax", "DDP Services"]
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    _coerce_numeric(df, req)
+    mismatches = df[(df["% Tax"] > tol) & (df["DDP Services"] > tol)].copy()
+    return mismatches
+
+
+def sanity_check_gmv_eur(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
+    req = ["Sell Price", "Discount", "DDP Services", "GMV EUR", "Exchange rate"]
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    _coerce_numeric(df, req)
+    # Only check rows where all required columns are present (not null)
+    valid_mask = df[req].notnull().all(axis=1)
+    df_valid = df[valid_mask].copy()
+    df_valid["expected_gmv"] = (df_valid["Sell Price"] - df_valid["Discount"] - df_valid["DDP Services"]) / df_valid["Exchange rate"]
+    diff = (df_valid["GMV EUR"] - df_valid["expected_gmv"]).abs()
+    rel_ok = diff <= (df_valid["expected_gmv"].abs() * rtol).fillna(0)
+    abs_ok = diff <= 0.01  # Always accept a difference of 0.01
+    df_valid["gmv_match"] = rel_ok | abs_ok
+    mismatches = df_valid.loc[~df_valid["gmv_match"]].copy()
+    mismatches["delta"] = mismatches["GMV EUR"] - mismatches["expected_gmv"]
+    return mismatches
+
+def sanity_check_gmv_net(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
+    req = ["% Tax", "GMV EUR", "GMV Net VAT"]
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    _coerce_numeric(df, req)
+    # Handle 0% tax correctly (should not set to NA)
+    percent = df["% Tax"].fillna(0)
+    df["expected_gmv_net"] = df["GMV EUR"] / (1 + percent / 100)
+    diff = (df["GMV Net VAT"] - df["expected_gmv_net"]).abs()
+    rel_ok = diff <= (df["expected_gmv_net"].abs() * rtol)
+    abs_ok = diff <= atol
+    df["gmv_net_match"] = (rel_ok.fillna(False) | abs_ok.fillna(False))
+    mismatches = df.loc[~df["gmv_net_match"]].copy()
+    mismatches["delta"] = mismatches["GMV Net VAT"] - mismatches["expected_gmv_net"]
+    return mismatches
 
 def fetch_orders_returns(start_date: str, end_date: str, brand: str) -> pd.DataFrame:
     client = bigquery.Client(project=BQ_PROJECT)
