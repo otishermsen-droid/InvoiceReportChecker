@@ -111,7 +111,7 @@ ddp_display = ddp_tax_mism[[
     c for c in ddp_cols if c in ddp_tax_mism.columns]]
 
 if not ddp_display.empty:
-    st.dataframe(ddp_display.head(50), use_container_width=True)
+    st.dataframe(ddp_display.head(50), width='stretch')
 
 
 
@@ -150,7 +150,7 @@ gmv_display = gmv_eur_mism[[c for c in gmv_cols if c in gmv_eur_mism.columns]]
 
 # Display the GMV EUR mismatches table if not empty
 if not gmv_display.empty:
-    st.dataframe(gmv_display.head(50), use_container_width=True)
+    st.dataframe(gmv_display.head(50), width='stretch')
 
 # Feedback banner (optional)
 if "gmv_eur_fix_feedback" not in st.session_state:
@@ -172,7 +172,7 @@ fix_gmv_eur_btn = st.button(
     "Auto-fix GMV EUR mismatches",
     type="primary",
     disabled=len(gmv_eur_mism) == 0,
-    use_container_width=True,
+    width='stretch',
 )
 
 if fix_gmv_eur_btn:
@@ -237,7 +237,7 @@ gmv_net_display = gmv_net_mism[[c for c in gmv_net_cols if c in gmv_net_mism.col
 
 # Display the GMV EUR mismatches table if not empty
 if not gmv_net_display.empty:
-    st.dataframe(gmv_net_display.head(50), use_container_width=True)
+    st.dataframe(gmv_net_display.head(50), width='stretch')
 
 # Feedback banner (optional)
 if "gmv_net_fix_feedback" not in st.session_state:
@@ -259,7 +259,7 @@ fix_gmv_net_btn = st.button(
     "Auto-fix GMV Net VAT mismatches",
     type="primary",
     disabled=len(gmv_net_mism) == 0,
-    use_container_width=True,
+    width='stretch',
 )
 
 if fix_gmv_net_btn:
@@ -338,14 +338,14 @@ if tlg_feedback is not None:
     st.session_state.tlg_fee_fix_feedback = None
 
 if not tlg_display.empty:
-    st.dataframe(tlg_display.head(50), use_container_width=True)
+    st.dataframe(tlg_display.head(50), width='stretch')
 
 # Action button underneath dataframe
 fix_tlg_btn = st.button(
     "Auto-fix TLG FEE mismatches",
     type="primary",
     disabled=len(tlg_fee_mism) == 0,
-    use_container_width=True,
+    width='stretch',
 )
 
 print("tlg_fee_mism ->", tlg_fee_mism)
@@ -434,14 +434,14 @@ cogs_cols = [
 cogs_display = cogs_mism[[c for c in cogs_cols if c in cogs_mism.columns]]
 
 if not cogs_display.empty:
-    st.dataframe(cogs_display.head(50), use_container_width=True)
+    st.dataframe(cogs_display.head(50), width='stretch')
 
 # Action button underneath dataframe
 fix_cogs_btn = st.button(
     "Auto-fix COGS mismatches",
     type="primary",
     disabled=len(cogs_mism) == 0,
-    use_container_width=True,
+    width='stretch',
 )
 
 if fix_cogs_btn:

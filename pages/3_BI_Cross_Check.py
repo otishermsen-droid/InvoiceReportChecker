@@ -86,7 +86,7 @@ st.sidebar.markdown(f"**End Date:** {end_date_str}")
 st.markdown("## BigQuery Data Fetch")
 
 # Query button
-if st.button("🔍 Query BigQuery", type="primary", use_container_width=True):
+if st.button("🔍 Query BigQuery", type="primary", width='stretch'):
     if not brand or len(brand) != 2:
         st.error("Please enter a valid 2-letter brand code!")
     else:
@@ -149,7 +149,7 @@ if "bq_df" in st.session_state and st.session_state.bq_df is not None:
         # Data types
         st.markdown("**Data Types:**")
         st.dataframe(bq_df.dtypes.to_frame(
-            'Data Type'), use_container_width=True)
+            'Data Type'), width='stretch')
 
     # Show the actual data
     st.markdown("### Raw Data")
@@ -166,7 +166,7 @@ if "bq_df" in st.session_state and st.session_state.bq_df is not None:
     # Display the dataframe
     st.dataframe(
         bq_df.head(show_rows),
-        use_container_width=True,
+        width='stretch',
         height=400
     )
 
@@ -200,7 +200,7 @@ if "bq_df" in st.session_state and st.session_state.bq_df is not None:
     numeric_cols = bq_df.select_dtypes(include=['number']).columns
     if len(numeric_cols) > 0:
         st.markdown("**Numeric Columns Summary:**")
-        st.dataframe(bq_df[numeric_cols].describe(), use_container_width=True)
+        st.dataframe(bq_df[numeric_cols].describe(), width='stretch')
 
     # Categorical columns analysis
     categorical_cols = bq_df.select_dtypes(
@@ -212,7 +212,7 @@ if "bq_df" in st.session_state and st.session_state.bq_df is not None:
                 value_counts = bq_df[col].value_counts().head(10)
                 st.markdown(f"**{col}:**")
                 st.dataframe(value_counts.to_frame(
-                    'Count'), use_container_width=True)
+                    'Count'), width='stretch')
 
 else:
     st.info("👆 Use the sidebar to configure your BigQuery query parameters and click 'Query BigQuery' to fetch data.")
