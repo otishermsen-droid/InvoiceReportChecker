@@ -33,6 +33,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Sidebar: Download latest DataFrame as CSV
+# ────────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### Download Processed Data")
+    if "df" in st.session_state and st.session_state.df is not None:
+        csv = st.session_state.df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download Corrected .CSV",
+            data=csv,
+            file_name="processed_invoice_report.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No updates to original CSV.")
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Require data and persist uploaded file
 # ────────────────────────────────────────────────────────────────────────────────
 
