@@ -137,7 +137,7 @@ def create_data_tools(df: pd.DataFrame):
                 labels={"GMV_EUR": "GMV EUR (€)", "Date": "Date"},
             )
             fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
             total_sales = float(tmp["GMV EUR"].sum())
             avg_daily = float(daily_sales["GMV_EUR"].mean())
