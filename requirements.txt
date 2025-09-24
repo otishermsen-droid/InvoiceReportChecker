@@ -6,3 +6,4 @@ llama-index-llms-openai
 llama-index-embeddings-openai
 plotly
 numpy
+llama_index.agent.openai
