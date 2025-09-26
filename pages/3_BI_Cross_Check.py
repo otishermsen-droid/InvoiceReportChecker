@@ -4,8 +4,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 from common import fetch_orders_returns
 
-st.set_page_config(page_title="Create Reports", layout="wide")
-st.title("📊 Create Reports from BigQuery")
+st.set_page_config(page_title="BQ Cross Check", layout="wide")
+st.title("📊 BQ Cross Check")
 
 # Check if data is available
 if "df" not in st.session_state or st.session_state.df is None:
