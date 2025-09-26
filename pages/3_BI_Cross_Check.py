@@ -13,38 +13,14 @@ if "df" not in st.session_state or st.session_state.df is None:
         "No data loaded. Please go to **Data Validation** and upload a CSV file first.")
     st.stop()
 
-# Sidebar for BigQuery configuration
+# Sidebar for BigQuery configuration (header only, settings removed)
 st.sidebar.header("🔧 BigQuery Configuration")
-
-# BigQuery settings
-with st.sidebar.expander("⚙️ BigQuery Settings", expanded=False):
-    bq_project = st.text_input(
-        "Project ID",
-        value="tlg-business-intelligence-prd",
-        help="Your BigQuery project ID"
-    )
-    bq_dataset = st.text_input(
-        "Dataset",
-        value="bi",
-        help="Your BigQuery dataset name"
-    )
-    bq_table = st.text_input(
-        "Table",
-        value="orders_returns_new",
-        help="Your BigQuery table name"
-    )
-
-    # Update environment variables
-    import os
-    os.environ["BQ_PROJECT"] = bq_project
-    os.environ["BQ_DATASET"] = bq_dataset
-    os.environ["BQ_TABLE"] = bq_table
 
 # Brand input
 brand = st.sidebar.text_input(
     "Brand (2-letter acronym)",
-    value="TL",
-    help="Enter a 2-letter brand code (e.g., TL, LV, etc.)",
+    value="PJ",
+    help="Enter a 2-letter brand code (e.g. DG, SC)",
     max_chars=2
 ).upper()
 
@@ -125,104 +101,29 @@ if "bq_df" in st.session_state and st.session_state.bq_df is not None:
     st.markdown("---")
     st.markdown("## 📋 Query Results")
 
-    # Display query info
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Rows", f"{len(bq_df):,}")
-    with col2:
-        st.metric("Brand", params["brand"])
-    with col3:
-        st.metric("Date Range",
-                  f"{params['start_date']} to {params['end_date']}")
-
-    # Data preview
-    st.markdown("### Data Preview")
-
-    # Show basic info
-    with st.expander("📊 Dataset Information", expanded=False):
-        st.markdown(
-            f"**Shape:** {bq_df.shape[0]:,} rows × {bq_df.shape[1]} columns")
-        st.markdown(f"**Columns:** {', '.join(bq_df.columns.tolist())}")
-        st.markdown(
-            f"**Memory Usage:** {bq_df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-
-        # Data types
-        st.markdown("**Data Types:**")
-        st.dataframe(bq_df.dtypes.to_frame(
-            'Data Type'), width='stretch')
-
     # Show the actual data
-    st.markdown("### Raw Data")
-
-    # Add filters
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        show_rows = st.slider("Number of rows to display",
-                              10, min(100, len(bq_df)), 50)
-    with col2:
-        if st.button("🔄 Refresh Preview"):
-            st.rerun()
+    st.markdown("#### Preview Data")
 
     # Display the dataframe
     st.dataframe(
-        bq_df.head(show_rows),
+        bq_df.head(50),
         width='stretch',
         height=400
     )
 
-    # Download options
-    st.markdown("### 💾 Download Options")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        csv_data = bq_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="📥 Download as CSV",
-            data=csv_data,
-            file_name=f"bigquery_data_{params['brand']}_{params['start_date']}_to_{params['end_date']}.csv",
-            mime="text/csv"
-        )
-
-    with col2:
-        json_data = bq_df.to_json(
-            orient='records', date_format='iso').encode('utf-8')
-        st.download_button(
-            label="📥 Download as JSON",
-            data=json_data,
-            file_name=f"bigquery_data_{params['brand']}_{params['start_date']}_to_{params['end_date']}.json",
-            mime="application/json"
-        )
+    csv_data = bq_df.to_csv(index=False).encode('utf-8-sig')
 
     # Data analysis
-    st.markdown("### 📈 Quick Analysis")
+    st.markdown("### 👀 BQ Cross Check")
 
-    # Numeric columns analysis
-    numeric_cols = bq_df.select_dtypes(include=['number']).columns
-    if len(numeric_cols) > 0:
-        st.markdown("**Numeric Columns Summary:**")
-        st.dataframe(bq_df[numeric_cols].describe(), width='stretch')
+    st.markdown("#### Units sold")
 
-    # Categorical columns analysis
-    categorical_cols = bq_df.select_dtypes(
-        include=['object', 'category']).columns
-    if len(categorical_cols) > 0:
-        st.markdown("**Categorical Columns Summary:**")
-        for col in categorical_cols[:5]:  # Show first 5 categorical columns
-            if col in bq_df.columns:
-                value_counts = bq_df[col].value_counts().head(10)
-                st.markdown(f"**{col}:**")
-                st.dataframe(value_counts.to_frame(
-                    'Count'), width='stretch')
+    st.markdown("#### Orders")
+
+    st.markdown("#### Returns")
+
+    st.markdown("### 🌍 DDP Check")
+
 
 else:
     st.info("👆 Use the sidebar to configure your BigQuery query parameters and click 'Query BigQuery' to fetch data.")
-
-    # Show example
-    st.markdown("### 💡 Example Usage")
-    st.markdown("""
-    1. **Enter Brand Code**: Type a 2-letter brand code (e.g., "TL", "LV")
-    2. **Select Date Range**: Choose start and end dates
-    3. **Click Query BigQuery**: Fetch data from your BigQuery table
-    4. **Preview Results**: View and analyze the returned data
-    5. **Download Data**: Export as CSV or JSON if needed
-    """)
