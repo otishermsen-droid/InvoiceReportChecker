@@ -8,6 +8,8 @@ from typing import Dict, Any, Tuple, Union
 import pandas as pd
 from google.cloud import bigquery
 
+from typing import List, Optional
+
 # =====================
 # Setup & configuration
 # =====================
@@ -172,18 +174,105 @@ def sanity_check_gmv_net(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
     mismatches["delta"] = mismatches["GMV Net VAT"] - mismatches["expected_gmv_net"]
     return mismatches
 
-def fetch_orders_returns(start_date: str, end_date: str, brand: str) -> pd.DataFrame:
+def fetch_orders_returns(start_date: str, end_date: str, brand: str, source_company: str) -> pd.DataFrame:
     client = bigquery.Client(project=BQ_PROJECT)
     sql = f"""
         SELECT *
         FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
-        WHERE brand = @brand AND DATE(order_date) BETWEEN @start_date AND @end_date
+        WHERE brand = @brand
+        AND source_company = @source_company
+        AND (
+            (row_type = 'O'  AND DATE(invoice_creation_date)     BETWEEN @start_date AND @end_date)
+            OR
+            (row_type = 'R' AND DATE(credit_note_creation_date) BETWEEN @start_date AND @end_date)
+        )
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("brand", "STRING", brand),
             bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
             bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+            bigquery.ScalarQueryParameter("source_company", "STRING", source_company),
         ]
     )
     return client.query(sql, job_config=job_config).to_dataframe()
+
+
+def fetch_brand_code(brand_input: str) -> Optional[str]:
+    """
+    Resolve a 2-letter brand input (e.g., 'PJ') to the canonical brand_code
+    from `config.brand`. Tries a few common column names defensively.
+    Returns None if not found.
+    """
+    client = bigquery.Client(project=BQ_PROJECT)
+    # Being liberal about column names: brand, brand_code, acronym, code
+    sql = f"""
+        SELECT brand_id AS brand_code
+        FROM `{BQ_PROJECT}.config.brand`
+        WHERE brand_code = @brand_input
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("brand_input", "STRING", brand_input.strip().upper())
+        ]
+    )
+    df = client.query(sql, job_config=job_config).to_dataframe()
+    if df.empty or df["brand_code"].isna().all():
+        return None
+    return str(df.iloc[0]["brand_code"]).strip()
+
+
+def fetch_ddp_config(brand_code: str, source_company: str) -> pd.DataFrame:
+    """
+    Pull DDP config rows for the given brand_code + ERP entity (source_company)
+    from `config.erp_ico_ddp`.
+    """
+    client = bigquery.Client(project=BQ_PROJECT)
+    sql = f"""
+        SELECT
+          brand_code,
+          shipping_country,
+          oms_location_name,
+          duty_recalculation,
+          ddp_fix,
+          ddp_perc,
+          treshold_amount,
+          currency_code,
+          application_date,
+          origin_country,
+          source_company
+        FROM `{BQ_PROJECT}.config.erp_ico_ddp`
+        WHERE UPPER(TRIM(brand_code)) = UPPER(@brand_code)
+          AND UPPER(TRIM(source_company)) = UPPER(@source_company)
+          AND shipping_country = 'US'
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("brand_code", "STRING", brand_code),
+            bigquery.ScalarQueryParameter("source_company", "STRING", source_company),
+        ]
+    )
+    return client.query(sql, job_config=job_config).to_dataframe()
+
+
+def fetch_items_origin(product_ids: List[str]) -> pd.DataFrame:
+    """
+    Fetch `product_id` and `made_in` (origin) from `bi.erp_items` for the provided IDs.
+    """
+    if not product_ids:
+        return pd.DataFrame(columns=["product_id", "made_in"])
+    client = bigquery.Client(project=BQ_PROJECT)
+    sql = f"""
+        SELECT DISTINCT
+          CAST(product_id AS STRING) AS product_id,
+          CAST(made_in AS STRING)    AS made_in
+        FROM `{BQ_PROJECT}.bi.erp_items`
+        WHERE CAST(product_id AS STRING) IN UNNEST(@ids)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("ids", "STRING", [str(x) for x in product_ids])
+        ]
+    )
+    return client.query(sql, job_config=job_config).to_dataframe()
+

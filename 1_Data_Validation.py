@@ -59,7 +59,7 @@ if "df" not in st.session_state or st.session_state.df is None:
         st.session_state.df = df
         st.session_state.uploaded_file = uploaded_file.getvalue()
     else:
-        st.warning("No CSV loaded yet. Go back to **Home** and upload a file.")
+        # st.warning("No CSV loaded yet. Go back to **Home** and upload a file.")
         st.stop()
 else:
     # If file is not in memory but was uploaded before, reload it
@@ -70,6 +70,9 @@ else:
         st.session_state.df = df
     else:
         df = st.session_state.df
+
+st.markdown("## Preview CSV")
+st.dataframe(df.head(50))
 
 if "tlg_fee_fix_feedback" not in st.session_state:
     st.session_state.tlg_fee_fix_feedback = None
