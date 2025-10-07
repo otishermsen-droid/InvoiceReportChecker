@@ -10,6 +10,9 @@ from google.cloud import bigquery
 
 from typing import List, Optional
 
+import streamlit as st
+from google.oauth2 import service_account
+
 # =====================
 # Setup & configuration
 # =====================
@@ -29,6 +32,11 @@ logging.basicConfig(
 BQ_PROJECT = os.environ.get("BQ_PROJECT", "tlg-business-intelligence-prd")
 BQ_DATASET = os.environ.get("BQ_DATASET", "bi")
 BQ_TABLE = os.environ.get("BQ_TABLE", "orders_returns_new")
+
+credentials = service_account.Credentials.from_service_account_info(
+    st.secrets["gcp_service_account"]
+)
+client = bigquery.Client(credentials=credentials)
 
 
 def _coerce_numeric(df: pd.DataFrame, cols) -> pd.DataFrame:
@@ -175,7 +183,6 @@ def sanity_check_gmv_net(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
     return mismatches
 
 def fetch_orders_returns(start_date: str, end_date: str, brand: str, source_company: str) -> pd.DataFrame:
-    client = bigquery.Client(project=BQ_PROJECT)
     sql = f"""
         SELECT *
         FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
@@ -204,7 +211,6 @@ def fetch_brand_code(brand_input: str) -> Optional[str]:
     from `config.brand`. Tries a few common column names defensively.
     Returns None if not found.
     """
-    client = bigquery.Client(project=BQ_PROJECT)
     # Being liberal about column names: brand, brand_code, acronym, code
     sql = f"""
         SELECT brand_id AS brand_code
@@ -227,7 +233,6 @@ def fetch_ddp_config(brand_code: str, source_company: str) -> pd.DataFrame:
     Pull DDP config rows for the given brand_code + ERP entity (source_company)
     from `config.erp_ico_ddp`.
     """
-    client = bigquery.Client(project=BQ_PROJECT)
     sql = f"""
         SELECT
           brand_code,
@@ -245,7 +250,7 @@ def fetch_ddp_config(brand_code: str, source_company: str) -> pd.DataFrame:
         WHERE UPPER(TRIM(brand_code)) = UPPER(@brand_code)
           AND UPPER(TRIM(source_company)) = UPPER(@source_company)
           AND shipping_country = 'US'
-    """
+    """ 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("brand_code", "STRING", brand_code),
@@ -261,7 +266,6 @@ def fetch_items_origin(product_ids: List[str]) -> pd.DataFrame:
     """
     if not product_ids:
         return pd.DataFrame(columns=["product_id", "made_in"])
-    client = bigquery.Client(project=BQ_PROJECT)
     sql = f"""
         SELECT DISTINCT
           CAST(product_id AS STRING) AS product_id,
