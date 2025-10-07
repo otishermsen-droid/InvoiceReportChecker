@@ -7,3 +7,4 @@ llama-index-embeddings-openai
 plotly
 numpy
 llama_index.agent.openai
+db-dtypes
