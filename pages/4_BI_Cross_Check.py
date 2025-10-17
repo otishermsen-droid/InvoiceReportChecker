@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from common import fetch_orders_returns
+from common import fetch_orders_returns, get_supported_brands
 import numpy as np
 import pandas as pd
 
@@ -22,13 +22,18 @@ else:
 # Sidebar for BigQuery configuration (header only, settings removed)
 st.sidebar.header("🔧 BigQuery Configuration")
 
-# Brand input
-brand = st.sidebar.text_input(
+# Brand selection (synced with previous page if present)
+brand_options = get_supported_brands()
+default_idx = brand_options.index("PJ") if "PJ" in brand_options else 0
+preselected = st.session_state.get("brand")
+if preselected in brand_options:
+    default_idx = brand_options.index(preselected)
+brand = st.sidebar.selectbox(
     "Brand (2-letter acronym)",
-    value="PJ",
-    help="Enter a 2-letter brand code (e.g. DG, SC)",
-    max_chars=2
-).upper()
+    options=brand_options,
+    index=default_idx,
+    help="Select the 2-letter brand code",
+)
 
 erpEntity = st.sidebar.selectbox(
     "ERP Entity",

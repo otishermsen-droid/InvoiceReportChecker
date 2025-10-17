@@ -7,7 +7,12 @@ from common import (
     sanity_check_gmv_eur,
     sanity_check_tlg_fee,
     load_invoicing_report,
-    sanity_check_gmv_net
+    sanity_check_gmv_net,
+    get_supported_brands,
+    fetch_tlg_fee_config,
+    fetch_ytd_totals_for_brand,
+    decide_fee_percent_from_config,
+    fetch_ytd_totals_until_date,
 )
 
 st.set_page_config(page_title="File Data Validation", layout="wide")
@@ -36,8 +41,70 @@ st.markdown("""
 # Sidebar: Download latest DataFrame as CSV
 # ────────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    # Brand selection
+    st.markdown("### Settings")
+    brand_options = get_supported_brands()
+    brand_default_idx = brand_options.index("PJ") if "PJ" in brand_options else 0
+    preselected = st.session_state.get("brand")
+    if preselected in brand_options:
+        brand_default_idx = brand_options.index(preselected)
+    brand = st.selectbox(
+        "Brand (2-letter code)",
+        options=brand_options,
+        index=brand_default_idx,
+        help="Pick the brand whose column mapping should be applied",
+    )
+    st.session_state["brand"] = brand
+    # ERP Entity selection (mirror BQ Cross Check)
+    erpEntity_options = ["THE LEVEL", "TLG_USA", "TLG_UK"]
+    erp_default_idx = 0
+    prior_erp = st.session_state.get("erpEntity")
+    if prior_erp in erpEntity_options:
+        erp_default_idx = erpEntity_options.index(prior_erp)
+    erpEntity = st.selectbox(
+        "ERP Entity",
+        options=erpEntity_options,
+        index=erp_default_idx,
+        help="Select the ERP Entity",
+    )
+    st.session_state["erpEntity"] = erpEntity
+
+    # Date range inputs (mirror BQ Cross Check)
+    st.subheader("📅 Date Range")
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input(
+            "Start Date",
+            help="Select the start date for YTD accumulation"
+        )
+    with col2:
+        end_date = st.date_input(
+            "End Date",
+            help="End date is used for display context only"
+        )
+    if 'validation_start_date' not in st.session_state or st.session_state.validation_start_date != start_date:
+        st.session_state.validation_start_date = start_date
+    if 'validation_end_date' not in st.session_state or st.session_state.validation_end_date != end_date:
+        st.session_state.validation_end_date = end_date
+    
+    # Show cached YTD KPIs and applied fee for the selected brand (if present)
+    ytd_map = st.session_state.get("ytd_totals", {})
+    applied_map = st.session_state.get("applied_tlg_fee_percent", {})
+    ytd_df = ytd_map.get(brand)
+    if ytd_df is not None and not getattr(ytd_df, "empty", True):
+        last = ytd_df.iloc[-1]
+        total_gmv = last.get("total_gmv_eur")
+        total_nmv = last.get("total_nmv_eur")
+        st.markdown("### YTD KPIs")
+        st.metric("YTD GMV (EUR)", f"{total_gmv:,.2f}" if pd.notna(total_gmv) else "-")
+        st.metric("YTD NMV (EUR)", f"{total_nmv:,.2f}" if pd.notna(total_nmv) else "-")
+    applied_fee = applied_map.get(brand)
+    if applied_fee is not None:
+        st.caption(f"Applied TLG fee: {applied_fee:.2f}%")
+    
     st.markdown("### Download Processed Data")
     if "df" in st.session_state and st.session_state.df is not None:
+        # Use the dataframe as-is; headers already reflect ERP-specific schema
         csv = st.session_state.df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download Corrected .CSV",
@@ -49,27 +116,47 @@ with st.sidebar:
         st.info("No updates to original CSV.")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Require data and persist uploaded file
+# Require data in session (no upload here) and apply single TLG fee
 # ────────────────────────────────────────────────────────────────────────────────
 
 if "df" not in st.session_state or st.session_state.df is None:
-    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
-    if uploaded_file is not None:
-        df = load_invoicing_report(uploaded_file)
-        st.session_state.df = df
-        st.session_state.uploaded_file = uploaded_file.getvalue()
-    else:
-        # st.warning("No CSV loaded yet. Go back to **Home** and upload a file.")
-        st.stop()
-else:
-    # If file is not in memory but was uploaded before, reload it
-    if "uploaded_file" in st.session_state and st.session_state.df is None:
-        from io import BytesIO
+    st.warning("No data loaded. Go to **File Upload** to load a CSV first.")
+    st.stop()
 
-        df = load_invoicing_report(BytesIO(st.session_state.uploaded_file))
-        st.session_state.df = df
-    else:
-        df = st.session_state.df
+df = st.session_state.df.copy()
+
+# If we have brand + config, compute one fee percent from YTD up to start date and apply to all rows
+cfg_map = st.session_state.get("tlg_fee_config", {})
+brand = st.session_state.get("brand")
+erpEntity = st.session_state.get("erpEntity")
+if brand and brand in cfg_map and isinstance(cfg_map[brand], pd.DataFrame):
+    try:
+        # Prefer YTD until selected start date if available
+        if 'validation_start_date' in st.session_state and st.session_state.validation_start_date is not None:
+            ytd_until = fetch_ytd_totals_until_date(
+                brand=brand,
+                end_date=st.session_state.validation_start_date.strftime("%Y-%m-%d"),
+            )
+            ytd_for_decision = ytd_until
+        else:
+            ytd_for_decision = st.session_state.get("ytd_totals", {}).get(brand)
+
+        fee_percent = decide_fee_percent_from_config(cfg_map[brand], ytd_for_decision)
+        if fee_percent is not None:
+            st.session_state.applied_tlg_fee_percent = st.session_state.get("applied_tlg_fee_percent", {})
+            st.session_state.applied_tlg_fee_percent[brand] = float(fee_percent)
+            # Apply to all rows
+            if "% TLG FEE" in df.columns:
+                df["% TLG FEE"] = float(fee_percent)
+            if "GMV Net VAT" in df.columns:
+                import pandas as pd
+                num = pd.to_numeric(df["GMV Net VAT"], errors="coerce").fillna(0)
+                df["TLG Fee"] = (num * (float(fee_percent) / 100.0)).round(2)
+            # Save back to session
+            st.session_state.df = df
+    except Exception:
+        pass
+
 
 st.markdown("## Preview CSV")
 st.dataframe(df.head(50))
@@ -79,11 +166,12 @@ if "tlg_fee_fix_feedback" not in st.session_state:
 if "cogs_fix_feedback" not in st.session_state:
     st.session_state.cogs_fix_feedback = None
 
-tlg_fee_mism = sanity_check_tlg_fee(df.copy(), atol=0.01, rtol=0.01)    
 cogs_mism = sanity_check_cogs(df.copy(), atol=0.01, rtol=0.01)
 ddp_tax_mism = sanity_checks_ddp_tax(df.copy())
 gmv_eur_mism = sanity_check_gmv_eur(df.copy())
 gmv_net_mism = sanity_check_gmv_net(df.copy())
+tlg_fee_mism = sanity_check_tlg_fee(df.copy(), atol=0.01, rtol=0.01)
+ 
 
 
 st.markdown("## Validation Results")
@@ -115,9 +203,6 @@ ddp_display = ddp_tax_mism[[
 
 if not ddp_display.empty:
     st.dataframe(ddp_display.head(50), width='stretch')
-
-
-
 
 # ────────────────────────────────────────────────────────────────────────────────
 # GMV CHECK EUR
@@ -315,7 +400,8 @@ tlg_cols = [
     "Product ID",
     "GMV Net VAT",
     "% TLG FEE",
-"TLG Fee",
+    "recalc_%TLG FEE",
+    "TLG Fee",
     "expected_tlg_fee",
     "delta",
 ]
@@ -462,6 +548,11 @@ if fix_cogs_btn:
                     updated_df.loc[idx, "COGS"] = expected_value
                     if "COGS2" in updated_df.columns:
                         updated_df.loc[idx, "COGS2"] = expected_value
+                    if "COGS x Qty" in updated_df.columns:
+                        type_val = updated_df.loc[idx, "Type"] if "Type" in updated_df.columns else None
+                        # Apply sign based on Type: positive for Order, negative for Return
+                        sign = 1 if str(type_val).strip().upper() == "ORDER" else -1
+                        updated_df.loc[idx, "COGS x Qty"] = expected_value * sign
                     rows_fixed += 1
 
         # Update the main dataframe
