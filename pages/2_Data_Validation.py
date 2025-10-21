@@ -13,6 +13,7 @@ from common import (
     fetch_ytd_totals_for_brand,
     decide_fee_percent_from_config,
     fetch_ytd_totals_until_date,
+    sanity_check_original_price_value,
 )
 
 st.set_page_config(page_title="File Data Validation", layout="wide")
@@ -151,12 +152,13 @@ if brand and brand in cfg_map and isinstance(cfg_map[brand], pd.DataFrame):
             if "GMV Net VAT" in df.columns:
                 import pandas as pd
                 num = pd.to_numeric(df["GMV Net VAT"], errors="coerce").fillna(0)
-                df["TLG Fee"] = (num * (float(fee_percent) / 100.0)).round(2)
+                # Only create TLG Fee column if it doesn't exist (for brands that have it)
+                if "TLG Fee" in df.columns:
+                    df["TLG Fee"] = (num * (float(fee_percent) / 100.0)).round(2)
             # Save back to session
             st.session_state.df = df
     except Exception:
         pass
-
 
 st.markdown("## Preview CSV")
 st.dataframe(df.head(50))
@@ -168,7 +170,7 @@ if "cogs_fix_feedback" not in st.session_state:
 
 cogs_mism = sanity_check_cogs(df.copy(), atol=0.01, rtol=0.01)
 ddp_tax_mism = sanity_checks_ddp_tax(df.copy())
-gmv_eur_mism = sanity_check_gmv_eur(df.copy())
+gmv_eur_mism = sanity_check_gmv_eur(df.copy()) if brand != "FE" else pd.DataFrame()
 gmv_net_mism = sanity_check_gmv_net(df.copy())
 tlg_fee_mism = sanity_check_tlg_fee(df.copy(), atol=0.01, rtol=0.01)
  
@@ -189,109 +191,213 @@ st.markdown("This issue can't be auto-fixed. If there are any cases where both D
 with st.expander("Show DDP/%Tax calculation info"):
     st.info(
         """
-**DDP/%Tax Coexistence Calculation:**  
-Rows are flagged if both `% Tax` and `DDP Services` are greater than the specified tolerance.  
+**DDP/Tax Coexistence Calculation:**  
+Rows are flagged if both `% Tax` (or `VAT%`) and `DDP Services` are greater than the specified tolerance.  
 This checks for cases where both are present, which may indicate a data issue.
 """,
         icon="ℹ️",
     )
 st.markdown(f"**{'PASSED ✅' if ddp_pass else 'NOT PASSED ❌'}**")
 st.write(f"Mismatches: **{len(ddp_tax_mism)}**")
-ddp_cols = ["Order Number", "Product ID", "% Tax", "DDP Services"]
+ddp_cols = ["Order Number", "Product ID", "% Tax", "VAT%", "DDP Services"]
 ddp_display = ddp_tax_mism[[
     c for c in ddp_cols if c in ddp_tax_mism.columns]]
 
 if not ddp_display.empty:
     st.dataframe(ddp_display.head(50), width='stretch')
 
-# ────────────────────────────────────────────────────────────────────────────────
-# GMV CHECK EUR
-# ────────────────────────────────────────────────────────────────────────────────
-
-st.markdown(
-    "#### 2. GMV EUR Check")
-with st.expander("Show GMV calculation info"):
-    st.info(
-        """
+if brand != "FE":
+    # ────────────────────────────────────────────────────────────────────────────
+    # GMV CHECK EUR (non-FE brands)
+    # ────────────────────────────────────────────────────────────────────────────
+    st.markdown("#### 2. GMV EUR Check")
+    with st.expander("Show GMV calculation info"):
+        st.info(
+            """
 **GMV Calculation:**  
 GMV is checked as:  
 `GMV EUR ≈ Sell Price - Discount - DDP Services`  
 Rows are flagged if the calculated GMV does not match the expected value.
 """,
-        icon="ℹ️",
+            icon="ℹ️",
+        )
+    st.markdown(f"**{'PASSED ✅' if gmv_pass else 'NOT PASSED ❌'}**")
+    st.write(f"Mismatches: **{len(gmv_eur_mism)}**")
+    gmv_cols = [
+        "Order Number",
+        "Product ID",
+        "Sell Price",
+        "Discount",
+        "DDP Services",
+        "GMV EUR",
+        "expected_gmv",
+        "delta",
+    ]
+    gmv_display = gmv_eur_mism[[c for c in gmv_cols if c in gmv_eur_mism.columns]]
+    if not gmv_display.empty:
+        st.dataframe(gmv_display.head(50), width='stretch')
+    if "gmv_eur_fix_feedback" not in st.session_state:
+        st.session_state.gmv_eur_fix_feedback = None
+    eu_feedback = st.session_state.get("gmv_eur_fix_feedback")
+    if eu_feedback is not None:
+        rows_fixed = eu_feedback.get("rows", 0)
+        status = eu_feedback.get("status")
+        if status == "success":
+            st.success(f"Auto-fixed {rows_fixed} row{'s' if rows_fixed != 1 else ''}.")
+        elif status == "info":
+            st.info("No GMV EUR mismatches were available to fix.")
+        elif status == "warning":
+            st.warning(eu_feedback.get("message", "Some rows could not be fixed."))
+        st.session_state.gmv_eur_fix_feedback = None
+    fix_gmv_eur_btn = st.button(
+        "Auto-fix GMV EUR mismatches",
+        type="primary",
+        disabled=len(gmv_eur_mism) == 0,
+        width='stretch',
     )
-st.markdown(f"**{'PASSED ✅' if gmv_pass else 'NOT PASSED ❌'}**")
-st.write(f"Mismatches: **{len(gmv_eur_mism)}**")
-gmv_cols = [
-    "Order Number",
-    "Product ID",
-    "Sell Price",
-    "Discount",
-    "DDP Services",
-    "GMV EUR",
-    "expected_gmv",
-    "delta",
-]
+    if fix_gmv_eur_btn:
+        try:
+            updated_df = st.session_state.df.copy()
+            idx = gmv_eur_mism.index.intersection(updated_df.index)
+            expected = gmv_eur_mism.loc[idx, "expected_gmv"]
+            mask = expected.notna()
+            updated_df.loc[idx[mask], "GMV EUR"] = expected[mask].values
+            rows_fixed = int(mask.sum())
+            st.session_state.df = updated_df
+            gmv_eur_mism = sanity_check_gmv_eur(st.session_state.df.copy())
+            gmv_net_mism = sanity_check_gmv_net(st.session_state.df.copy())
+            cogs_mism = sanity_check_cogs(st.session_state.df.copy(), atol=0.01, rtol=0.01)
+            st.session_state.gmv_eur_fix_feedback = {
+                "status": "success" if rows_fixed else "info",
+                "rows": rows_fixed,
+            }
+        except Exception as e:
+            st.session_state.gmv_eur_fix_feedback = {
+                "status": "warning",
+                "rows": 0,
+                "message": f"GMV EUR auto-fix failed: {e}",
+            }
+        st.rerun()
+else:
+    # ────────────────────────────────────────────────────────────────────────────
+    # FE ONLY: Original Price Value Check
+    # ────────────────────────────────────────────────────────────────────────────
+    opv_mism = sanity_check_original_price_value(df.copy())
+    opv_pass = len(opv_mism) == 0
+    st.markdown("#### 2. Original Price Value Check (Ferrari)")
+    with st.expander("Show Original Price Value calculation info"):
+        st.info(
+            """
+**Original Price Value Calculation (Ferrari):**  
+Original Price Value is checked as:  
+`Original Price Value ≈ Gross price - Sales Tax - DDP Services`  
+If `Gross price` is missing for a row, the expected value is 0.
+""",
+            icon="ℹ️",
+        )
+    st.markdown(f"**{'PASSED ✅' if opv_pass else 'NOT PASSED ❌'}**")
+    st.write(f"Mismatches: **{len(opv_mism)}**")
+    opv_cols = [
+        "Order Number",
+        "Product ID",
+        "Gross price",
+        "Sales Tax",
+        "DDP Services",
+        "Original Price Value",
+        "expected_original_price_value",
+        "delta",
+    ]
+    opv_display = opv_mism[[c for c in opv_cols if c in opv_mism.columns]]
+    # Ensure 'Original Price Value' appears even if it wasn't carried through (defensive)
+    if "Original Price Value" not in opv_display.columns and "Original Price Value" in df.columns:
+        try:
+            opv_display = opv_display.join(
+                df.loc[opv_mism.index, ["Original Price Value"]]
+            )
+        except Exception:
+            pass
+    if not opv_display.empty:
+        st.dataframe(opv_display.head(50), width='stretch')
+    if "opv_fix_feedback" not in st.session_state:
+        st.session_state.opv_fix_feedback = None
+    fix_opv_btn = st.button(
+        "Auto-fix Original Price Value mismatches",
+        type="primary",
+        disabled=len(opv_mism) == 0,
+        width='stretch',
+    )
+    if fix_opv_btn:
+        try:
+            updated_df = st.session_state.df.copy()
+            idx = opv_mism.index.intersection(updated_df.index)
+            expected = opv_mism.loc[idx, "expected_original_price_value"]
+            mask = expected.notna()
+            updated_df.loc[idx[mask], "Original Price Value"] = expected[mask].values
+            rows_fixed = int(mask.sum())
+            st.session_state.df = updated_df
+            st.session_state.opv_fix_feedback = {
+                "status": "success" if rows_fixed else "info",
+                "rows": rows_fixed,
+            }
+        except Exception as e:
+            st.session_state.opv_fix_feedback = {
+                "status": "warning",
+                "rows": 0,
+                "message": f"Original Price Value auto-fix failed: {e}",
+            }
+        st.rerun()
 
+    # ────────────────────────────────────────────────────────────────────────────
+    # FE ONLY: Returns discount consistency check (CSV Discount Value vs BQ order discount)
+    # ────────────────────────────────────────────────────────────────────────────
+    st.markdown("#### 2b. Returns Discount Consistency (Ferrari)")
+    with st.expander("Show returns discount consistency info"):
+        st.info(
+            """
+Compares `Discount Value` on return rows (Type == R) against the order `discount` fetched from BI.
+If they differ beyond tolerance, the row is flagged. Auto-fix sets `Discount Value` to the BI order `discount`.
+""",
+            icon="ℹ️",
+        )
 
-gmv_display = gmv_eur_mism[[c for c in gmv_cols if c in gmv_eur_mism.columns]]
-
-# Display the GMV EUR mismatches table if not empty
-if not gmv_display.empty:
-    st.dataframe(gmv_display.head(50), width='stretch')
-
-# Feedback banner (optional)
-if "gmv_eur_fix_feedback" not in st.session_state:
-    st.session_state.gmv_eur_fix_feedback = None
-eu_feedback = st.session_state.get("gmv_eur_fix_feedback")
-if eu_feedback is not None:
-    rows_fixed = eu_feedback.get("rows", 0)
-    status = eu_feedback.get("status")
-    if status == "success":
-        st.success(f"Auto-fixed {rows_fixed} row{'s' if rows_fixed != 1 else ''}.")
-    elif status == "info":
-        st.info("No GMV EUR mismatches were available to fix.")
-    elif status == "warning":
-        st.warning(eu_feedback.get("message", "Some rows could not be fixed."))
-    st.session_state.gmv_eur_fix_feedback = None
-
-# Auto-fix button
-fix_gmv_eur_btn = st.button(
-    "Auto-fix GMV EUR mismatches",
-    type="primary",
-    disabled=len(gmv_eur_mism) == 0,
-    width='stretch',
-)
-
-if fix_gmv_eur_btn:
     try:
-        updated_df = st.session_state.df.copy()
+        ret_mask = (df.get("Type").astype(str).str.strip().str.upper() == "R") if "Type" in df.columns else pd.Series([False] * len(df))
+        has_cols = ("Discount Value" in df.columns) and ("discount" in df.columns)
+        discount_mism = pd.DataFrame()
+        if has_cols and ret_mask.any():
+            sub = df.loc[ret_mask, [c for c in ["Order Number", "Product ID", "Discount Value", "discount"] if c in df.columns]].copy()
+            sub["Discount Value"] = pd.to_numeric(sub["Discount Value"], errors="coerce")
+            sub["discount"] = pd.to_numeric(sub["discount"], errors="coerce")
+            sub["delta"] = (sub["Discount Value"].fillna(0) - sub["discount"].fillna(0)).round(2)
+            discount_mism = sub[(sub["delta"].abs() > 0.01)]
 
-        # vectorized: align on index intersection, ignore NaNs in expected
-        idx = gmv_eur_mism.index.intersection(updated_df.index)
-        expected = gmv_eur_mism.loc[idx, "expected_gmv"]
-        mask = expected.notna()
-        updated_df.loc[idx[mask], "GMV EUR"] = expected[mask].values
-        rows_fixed = int(mask.sum())
+        st.markdown(f"**{'PASSED ✅' if discount_mism.empty else 'NOT PASSED ❌'}**")
+        st.write(f"Mismatches: **{0 if discount_mism is None else len(discount_mism)}**")
+        if discount_mism is not None and not discount_mism.empty:
+            st.dataframe(discount_mism.head(50), width='stretch')
 
-        st.session_state.df = updated_df
-
-        # Recompute *all* affected checks (GMV EUR influences GMV Net VAT & downstream COGS)
-        gmv_eur_mism = sanity_check_gmv_eur(st.session_state.df.copy())
-        gmv_net_mism = sanity_check_gmv_net(st.session_state.df.copy())
-        cogs_mism = sanity_check_cogs(st.session_state.df.copy(), atol=0.01, rtol=0.01)
-
-        st.session_state.gmv_eur_fix_feedback = {
-            "status": "success" if rows_fixed else "info",
-            "rows": rows_fixed,
-        }
-    except Exception as e:
-        st.session_state.gmv_eur_fix_feedback = {
-            "status": "warning",
-            "rows": 0,
-            "message": f"GMV EUR auto-fix failed: {e}",
-        }
-    st.rerun()
+        fix_discount_btn = st.button(
+            "Auto-fix Returns Discount mismatches",
+            type="primary",
+            disabled=discount_mism is None or discount_mism.empty,
+            width='stretch',
+        )
+        if fix_discount_btn and discount_mism is not None and not discount_mism.empty:
+            try:
+                updated_df = st.session_state.df.copy()
+                # Align indices for return rows
+                idx = discount_mism.index.intersection(updated_df.index)
+                expected = discount_mism.loc[idx, "discount"]
+                mask = expected.notna()
+                updated_df.loc[idx[mask], "Discount Value"] = expected[mask].values
+                rows_fixed = int(mask.sum())
+                st.session_state.df = updated_df
+                st.success(f"Auto-fixed {rows_fixed} row{'s' if rows_fixed != 1 else ''}.")
+            except Exception as e:
+                st.warning(f"Returns Discount auto-fix failed: {e}")
+            st.rerun()
+    except Exception:
+        pass
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -300,27 +406,60 @@ if fix_gmv_eur_btn:
 
 st.markdown("#### 3. GMV Net VAT Check")
 with st.expander("Show GMV Net VAT calculation info"):
-    st.info(
-        """
-**GMV Net VAT Calculation:**  
-GMV Net VAT is checked as:  
-`GMV Net VAT ≈ GMV EUR / (1 + (% Tax / 100))`  
+    if brand == "FE":
+        st.info(
+            """
+**GMV Net VAT Calculation (Ferrari):**
+
+ROW: `(Original Price Value - Discount Value) / (1 + VAT/100) / Exchange rate`
+ 
+GB — Duties = 0: `(Original Price Value - Discount Value) / (1 + VAT/100) / Exchange rate`
+ 
+GB — Duties > 0: `(Original Price Value - Discount Value) / Exchange rate`
+""",
+            icon="ℹ️",
+        )
+    else:
+        st.info(
+            """
+**GMV Net VAT Calculation:**
+GMV Net VAT is checked as:
+`GMV Net VAT ≈ GMV EUR / (1 + (% Tax or VAT% / 100))`
 Rows are flagged if the calculated GMV Net VAT does not match the expected value.
 """,
-        icon="ℹ️",
-    )
+            icon="ℹ️",
+        )
 gmv_net_pass = len(gmv_net_mism) == 0
 st.markdown(f"**{'PASSED ✅' if gmv_net_pass else 'NOT PASSED ❌'}**")
 st.write(f"Mismatches: **{len(gmv_net_mism)}**")
 gmv_net_cols = [
     "Order Number",
     "Product ID",
-    "GMV EUR",
-    "% Tax",
-    "GMV Net VAT",
-    "expected_gmv_net",
-    "delta",
 ]
+if brand == "FE":
+    fe_cols = [
+        "Shipping Country",
+        "Original Price Value",
+        "Discount Value",
+        "% Tax",
+        "VAT%",
+        "Exchange rate",
+        "DDP Services",
+        "GMV Net VAT",
+        "expected_gmv_net",
+        "delta",
+    ]
+    gmv_net_cols.extend(fe_cols)
+else:
+    non_fe_cols = [
+        "GMV EUR",
+        "% Tax",
+        "VAT%",
+        "GMV Net VAT",
+        "expected_gmv_net",
+        "delta",
+    ]
+    gmv_net_cols.extend(non_fe_cols)
 gmv_net_display = gmv_net_mism[[c for c in gmv_net_cols if c in gmv_net_mism.columns]]
 
 # Display the GMV EUR mismatches table if not empty
@@ -437,23 +576,37 @@ fix_tlg_btn = st.button(
     width='stretch',
 )
 
-print("tlg_fee_mism ->", tlg_fee_mism)
-
 if fix_tlg_btn:
     try:
-        # Simple approach: update TLG Fee with expected_tlg_fee for all mismatch rows
+        # Update both TLG Fee and % TLG FEE for all mismatch rows
         updated_df = st.session_state.df.copy()
 
         # Get the indices of rows that have mismatches
         mismatch_indices = tlg_fee_mism.index
 
-        # Update TLG Fee with expected values for mismatch rows
+        # Update both TLG Fee and % TLG FEE for mismatch rows
         rows_fixed = 0
         for idx in mismatch_indices:
             if idx in updated_df.index and 'expected_tlg_fee' in tlg_fee_mism.columns:
                 expected_value = tlg_fee_mism.loc[idx, 'expected_tlg_fee']
                 if pd.notna(expected_value):
-                    updated_df.loc[idx, 'TLG Fee'] = expected_value
+                    # Update TLG Fee with expected value (only if column exists)
+                    if 'TLG Fee' in updated_df.columns:
+                        updated_df.loc[idx, 'TLG Fee'] = expected_value
+                    
+                    # Update % TLG FEE with the percentage that was used for calculation
+                    # Check if we have recalc_%TLG FEE (decimal format) or use original % TLG FEE
+                    if 'recalc_%TLG FEE' in tlg_fee_mism.columns and pd.notna(tlg_fee_mism.loc[idx, 'recalc_%TLG FEE']):
+                        # recalc_%TLG FEE is in decimal format (0.15), convert to percentage (15)
+                        recalc_percent = tlg_fee_mism.loc[idx, 'recalc_%TLG FEE']
+                        if '% TLG FEE' in updated_df.columns:
+                            updated_df.loc[idx, '% TLG FEE'] = recalc_percent * 100
+                    elif '% TLG FEE' in tlg_fee_mism.columns and pd.notna(tlg_fee_mism.loc[idx, '% TLG FEE']):
+                        # Keep the original percentage if recalc is not available
+                        original_percent = tlg_fee_mism.loc[idx, '% TLG FEE']
+                        if '% TLG FEE' in updated_df.columns:
+                            updated_df.loc[idx, '% TLG FEE'] = original_percent
+                    
                     rows_fixed += 1
 
         # Update the main dataframe

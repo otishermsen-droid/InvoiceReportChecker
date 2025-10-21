@@ -11,6 +11,12 @@ if "df" not in st.session_state or st.session_state.df is None:
 
 df = st.session_state.df.copy()
 
+# Remove internal calculation columns that shouldn't be in the final export
+columns_to_remove = ["recalc_%TLG FEE"]
+for col in columns_to_remove:
+    if col in df.columns:
+        df = df.drop(columns=[col])
+
 st.markdown("## Preview Updated DataFrame")
 st.dataframe(df.head(100))
 

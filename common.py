@@ -13,6 +13,18 @@ from typing import List, Optional
 import streamlit as st
 from google.oauth2 import service_account
 
+from collections.abc import Iterable
+import re
+from typing import Optional, Any
+
+from typing import Any, Optional
+import pandas as pd
+
+from typing import Optional, Any, Iterable
+import pandas as pd
+import numpy as np
+
+
 # =====================
 # Setup & configuration
 # =====================
@@ -127,7 +139,6 @@ BRAND_HEADERS: Dict[str, List[str]] = {
     ]
 }
 
-
 def get_supported_brands() -> List[str]:
     """Return supported brand codes for the dropdown."""
     brands = sorted({code.strip().upper() for code in BRAND_HEADERS.keys()})
@@ -158,6 +169,60 @@ def _coerce_numeric(df: pd.DataFrame, cols) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+def _normalize_numeric_text_series(series: pd.Series) -> pd.Series:
+    """Normalize mixed-format numeric text to standard dotted-decimal strings.
+
+    Handles:
+    - Currency symbols (€, $, £)
+    - Non-breaking/regular spaces and tabs
+    - Parentheses for negatives (e.g., (1.234,56))
+    - Mixed thousands/decimal separators (dot/comma)
+    """
+    def normalize_value(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+
+        # Normalize minus variants and detect parentheses negatives
+        text = text.replace("−", "-")
+        is_negative = text.startswith("(") and text.endswith(")")
+        if is_negative:
+            text = text[1:-1]
+
+        # Remove currency symbols and whitespace artifacts
+        text = (
+            text.replace("\u00A0", "")  # NBSP
+                .replace(" ", "")
+                .replace("\t", "")
+                .replace("€", "")
+                .replace("$", "")
+                .replace("£", "")
+        )
+
+        # Determine decimal separator by rightmost occurrence of '.' or ','
+        last_dot = text.rfind(".")
+        last_comma = text.rfind(",")
+
+        if last_dot == -1 and last_comma == -1:
+            # No explicit decimal separator: keep only digits and an optional leading '-'
+            cleaned = re.sub(r"[^0-9-]", "", text)
+        else:
+            # Choose rightmost as decimal separator
+            decimal_sep = "." if last_dot > last_comma else ","
+            parts = text.rsplit(decimal_sep, 1)
+            left = re.sub(r"[^0-9-]", "", parts[0])
+            right = re.sub(r"[^0-9]", "", parts[1]) if len(parts) > 1 else ""
+            cleaned = f"{left}.{right}" if right != "" else left
+
+        if is_negative and not cleaned.startswith("-") and cleaned != "":
+            cleaned = f"-{cleaned}"
+        return cleaned
+
+    return series.astype(object).apply(normalize_value)
 
 
 def load_invoicing_report(file: Union[io.BytesIO, str], brand: Optional[str] = None, erp_entity: Optional[str] = None) -> pd.DataFrame:
@@ -226,19 +291,30 @@ def load_invoicing_report(file: Union[io.BytesIO, str], brand: Optional[str] = N
 
     # Brand-specific numeric normalization (before coercion)
     brand_key = (brand or "").strip().upper()
-    if brand_key == "AT" or brand_key == "FO" or brand_key == "AL" or brand_key == "CV":
-        # AT brand: values like "374,180" (comma decimal). Normalize to dot decimals.
+    if brand_key in {"AT", "FO", "AL", "CV"}:
+        # Legacy normalization kept for specific brands (COGS only)
         if "COGS" in df.columns:
             df["COGS"] = (
                 df["COGS"].astype(str)
-                .str.replace("\u00A0", "", regex=False)  # non-breaking spaces
-                .str.replace(" ", "", regex=False)       # regular spaces
-                .str.replace(".", "", regex=False)       # thousands separator
-                .str.replace(",", ".", regex=False)      # decimal comma -> dot
+                .str.replace("\u00A0", "", regex=False)
+                .str.replace(" ", "", regex=False)
+                .str.replace(".", "", regex=False)
+                .str.replace(",", ".", regex=False)
             )
 
+    # Ferrari (FE/FA): normalize all numeric columns to handle currency symbols and mixed separators
+    if brand_key in {"FE", "FA"}:
+        for c in [
+            "Qty", "COGS", "% Tax", "VAT%",
+            "Original Price", "Original Price Value", "Sales Tax", "Discount Value",
+            "Sell Price", "Discount", "DDP Services",
+            "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2"
+        ]:
+            if c in df.columns:
+                df[c] = _normalize_numeric_text_series(df[c])
+
     num_cols = [
-        "Qty", "COGS", "% Tax", "Original Price", "Sell Price", "Discount", "DDP Services",
+        "Qty", "COGS", "% Tax", "VAT%", "Original Price", "Original Price Value", "Sales Tax", "Discount Value", "Sell Price", "Discount", "DDP Services",
         "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2"
     ]
     df = _coerce_numeric(df, num_cols)
@@ -251,19 +327,38 @@ def sanity_check_tlg_fee(
     rtol: float = 0.01,
     override_percent: Optional[float] = None,
 ) -> pd.DataFrame:
+    # Check if TLG Fee column exists - if not, return empty DataFrame
+    if "TLG Fee" not in df.columns:
+        return pd.DataFrame()
+    
     req = ["TLG Fee", "GMV Net VAT", "% TLG FEE"]
     missing = [c for c in req if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
     _coerce_numeric(df, req)
+    
     # Decide which percent to use: optional override from UI; otherwise prefer recalc column, then original column
     if override_percent is not None and pd.notna(override_percent) and float(override_percent) > 0:
         percent_series = pd.Series(float(override_percent), index=df.index)
+        # Override is assumed to be in percentage format, so divide by 100
+        percent_series = percent_series / 100
     else:
         source_col = "recalc_%TLG FEE" if "recalc_%TLG FEE" in df.columns else "% TLG FEE"
-        # Avoid division by zero and NaN by replacing explicit 0 with NA to enable abs_ok tolerance
-        percent_series = df[source_col].replace(0, pd.NA)
-    df["expected_tlg_fee"] = (df["GMV Net VAT"] * (percent_series / 100)).round(2)
+        # Use 0 instead of NA for zero/blank percents
+        percent_series = df[source_col]
+        
+        # Handle different formats: recalc_%TLG FEE is in decimal (0.15), % TLG FEE is in percentage (15)
+        if source_col == "recalc_%TLG FEE":
+            # recalc_%TLG FEE is already in decimal format, no conversion needed
+            pass
+        else:
+            # % TLG FEE is in percentage format, convert to decimal
+            percent_series = percent_series / 100
+
+    # Ensure missing percents or GMV yield expected fee of 0 (not NaN)
+    df["expected_tlg_fee"] = (
+        df["GMV Net VAT"].fillna(0) * percent_series.fillna(0)
+    ).round(2)
     diff = (df["TLG Fee"] - df["expected_tlg_fee"]).abs()
     rel_ok = diff <= (df["expected_tlg_fee"].abs() * rtol).fillna(0)
     abs_ok = diff <= atol
@@ -274,16 +369,40 @@ def sanity_check_tlg_fee(
     return mismatches
 
 def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
+    # Skip COGS check for Ferrari (FE): TLG Fee is not available, so cannot compute expected COGS
+    try:
+        brand_key = st.session_state.get("brand")
+        if isinstance(brand_key, str) and brand_key.strip().upper() == "FE":
+            return pd.DataFrame()
+    except Exception:
+        # If session state is unavailable, proceed with generic logic
+        pass
+
     # COGS ≈ GMV Net VAT - TLG Fee
-    req = ["COGS", "GMV Net VAT", "TLG Fee"]
+    req = ["COGS", "GMV Net VAT"]
     missing = [c for c in req if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    _coerce_numeric(df, req) 
-
-    # Compute expectations
-    df["expected_cogs"] = df["GMV Net VAT"] - df["TLG Fee"]
+    # Check if we have TLG Fee column or need to calculate it
+    if "TLG Fee" in df.columns:
+        # Use existing TLG Fee column
+        req.append("TLG Fee")
+        _coerce_numeric(df, req)
+        df["expected_cogs"] = df["GMV Net VAT"] - df["TLG Fee"]
+    elif "recalc_%TLG FEE" in df.columns and "GMV Net VAT" in df.columns:
+        # Calculate TLG Fee from recalc_%TLG FEE (decimal format)
+        _coerce_numeric(df, req + ["recalc_%TLG FEE"])
+        df["calculated_tlg_fee"] = (df["GMV Net VAT"] * df["recalc_%TLG FEE"]).round(2)
+        df["expected_cogs"] = df["GMV Net VAT"] - df["calculated_tlg_fee"]
+    elif "% TLG FEE" in df.columns and "GMV Net VAT" in df.columns:
+        # Calculate TLG Fee from % TLG FEE (percentage format)
+        _coerce_numeric(df, req + ["% TLG FEE"])
+        df["calculated_tlg_fee"] = (df["GMV Net VAT"] * (df["% TLG FEE"] / 100)).round(2)
+        df["expected_cogs"] = df["GMV Net VAT"] - df["calculated_tlg_fee"]
+    else:
+        # No way to calculate TLG Fee, return empty DataFrame
+        return pd.DataFrame()
 
     # Safe numeric diff
     diff = (df["COGS"] - df["expected_cogs"]).abs()
@@ -305,20 +424,32 @@ def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) 
 
 
 def sanity_checks_ddp_tax(df: pd.DataFrame, tol: float = 0.01) -> pd.DataFrame:
-    req = ["% Tax", "DDP Services"]
-    missing = [c for c in req if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+    # Check if both required columns exist - if not, return empty DataFrame
+    if "DDP Services" not in df.columns:
+        return pd.DataFrame()
+    
+    # Check for either % Tax or VAT% column
+    tax_col = None
+    if "% Tax" in df.columns:
+        tax_col = "% Tax"
+    elif "VAT%" in df.columns:
+        tax_col = "VAT%"
+    else:
+        return pd.DataFrame()
+    
+    req = [tax_col, "DDP Services"]
     _coerce_numeric(df, req)
-    mismatches = df[(df["% Tax"] > tol) & (df["DDP Services"] > tol)].copy()
+    mismatches = df[(df[tax_col] > tol) & (df["DDP Services"] > tol)].copy()
     return mismatches
 
 
 def sanity_check_gmv_eur(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
+    # Check if all required columns exist - if not, return empty DataFrame
     req = ["Sell Price", "Discount", "DDP Services", "GMV EUR", "Exchange rate"]
     missing = [c for c in req if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+        return pd.DataFrame()
+    
     _coerce_numeric(df, req)
     # Only check rows where all required columns are present (not null)
     valid_mask = df[req].notnull().all(axis=1)
@@ -333,13 +464,77 @@ def sanity_check_gmv_eur(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
     return mismatches
 
 def sanity_check_gmv_net(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
-    req = ["% Tax", "GMV EUR", "GMV Net VAT"]
+    # Ferrari-specific formula
+    try:
+        brand_key = st.session_state.get("brand")
+    except Exception:
+        brand_key = None
+    if isinstance(brand_key, str) and brand_key.strip().upper() == "FE":
+        # Require needed columns
+        req = ["Original Price Value", "Discount Value", "GMV Net VAT", "Exchange rate"]
+        # VAT may be in either column
+        tax_col = "% Tax" if "% Tax" in df.columns else "VAT%" if "VAT%" in df.columns else None
+        if tax_col:
+            req.append(tax_col)
+        # Duties/GB distinction via DDP Services; if present and > 0 then use duties>0 rule
+        duties_col_present = "DDP Services" in df.columns
+        missing = [c for c in req if c not in df.columns]
+        if missing:
+            return pd.DataFrame()
+        _coerce_numeric(df, req + (["DDP Services"] if duties_col_present else []))
+
+        base = (df["Original Price Value"].fillna(0) - df["Discount Value"].fillna(0))
+        exch = df["Exchange rate"].replace(0, pd.NA)
+        if tax_col:
+            percent = df[tax_col].fillna(0)
+        else:
+            percent = pd.Series(0, index=df.index)
+
+        # Precompute ROW expected (ignores duties): (OPV - Discount)/(1+VAT/100)
+        expected_row_pre = (base / (1 + percent / 100))
+
+        # Determine GB vs ROW using Shipping Country
+        ship_series = df.get("Shipping Country")
+        if ship_series is not None:
+            ship_norm = ship_series.astype(str).str.strip().str.upper()
+            is_gb = ship_norm == "GB"
+        else:
+            # If shipping country missing, default to ROW behavior
+            is_gb = pd.Series([False] * len(df), index=df.index)
+
+        # Within GB: if duties > 0 then skip VAT division; else behave like ROW
+        if duties_col_present:
+            duties = df["DDP Services"].fillna(0)
+            expected_pre = np.where(is_gb, np.where(duties > 0, base, expected_row_pre), expected_row_pre)
+        else:
+            expected_pre = expected_row_pre
+
+        # Finally divide by currency factor (exchange rate)
+        df["expected_gmv_net"] = pd.Series(expected_pre, index=df.index) / exch
+
+        diff = (df["GMV Net VAT"] - df["expected_gmv_net"]).abs()
+        rel_ok = diff <= (df["expected_gmv_net"].abs() * rtol)
+        abs_ok = diff <= atol
+        df["gmv_net_match"] = (rel_ok.fillna(False) | abs_ok.fillna(False))
+        mismatches = df.loc[~df["gmv_net_match"]].copy()
+        mismatches["delta"] = mismatches["GMV Net VAT"] - mismatches["expected_gmv_net"]
+        return mismatches
+
+    # Default formula (non-FE)
+    # Check for either % Tax or VAT% column
+    tax_col = None
+    if "% Tax" in df.columns:
+        tax_col = "% Tax"
+    elif "VAT%" in df.columns:
+        tax_col = "VAT%"
+    else:
+        return pd.DataFrame()
+    req = [tax_col, "GMV EUR", "GMV Net VAT"]
     missing = [c for c in req if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+        return pd.DataFrame()
     _coerce_numeric(df, req)
-    # Handle 0% tax correctly (should not set to NA)
-    percent = df["% Tax"].fillna(0)
+    percent = df[tax_col].fillna(0)
     df["expected_gmv_net"] = df["GMV EUR"] / (1 + percent / 100)
     diff = (df["GMV Net VAT"] - df["expected_gmv_net"]).abs()
     rel_ok = diff <= (df["expected_gmv_net"].abs() * rtol)
@@ -349,27 +544,99 @@ def sanity_check_gmv_net(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
     mismatches["delta"] = mismatches["GMV Net VAT"] - mismatches["expected_gmv_net"]
     return mismatches
 
-def fetch_orders_returns(start_date: str, end_date: str, brand: str, source_company: str) -> pd.DataFrame:
-    sql = f"""
-        SELECT *
-        FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
-        WHERE brand = @brand
-        AND source_company = @source_company
-        AND (
-            (row_type = 'O'  AND DATE(invoice_creation_date)     BETWEEN @start_date AND @end_date)
-            OR
-            (row_type = 'R' AND DATE(credit_note_creation_date) BETWEEN @start_date AND @end_date)
-        )
+def sanity_check_original_price_value(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) -> pd.DataFrame:
+    """Check Original Price Value ≈ Gross price - Sales Tax - DDP Services.
+
+    If `Gross price` is missing or null for a row, expected value is 0.
+    Returns a DataFrame of mismatches with columns including the expected value and delta.
+    If required columns are missing, returns an empty DataFrame.
     """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
+    # Required columns (Gross price optional per-row but required as a column)
+    if "Gross price" not in df.columns:
+        return pd.DataFrame()
+
+    req_core = ["Original Price Value", "Sales Tax", "DDP Services"]
+    missing = [c for c in req_core if c not in df.columns]
+    if missing:
+        return pd.DataFrame()
+    # Coerce numeric
+    _coerce_numeric(df, req_core + ["Gross price"])
+
+    # Build expected with rule: if Gross price is NaN -> expected 0; else gross - taxes - ddp
+    base = pd.to_numeric(df["Gross price"], errors="coerce")
+    sales_tax = pd.to_numeric(df["Sales Tax"], errors="coerce").fillna(0)
+    ddp = pd.to_numeric(df["DDP Services"], errors="coerce").fillna(0)
+
+    expected = (base - sales_tax - ddp)
+    expected = expected.where(base.notna(), 0)
+
+    df_work = df.copy()
+    df_work["expected_original_price_value"] = expected
+
+    # Compare using tolerances
+    diff = (df_work["Original Price Value"] - df_work["expected_original_price_value"]).abs()
+    rel_ok = diff <= (df_work["expected_original_price_value"].abs() * rtol).fillna(0)
+    abs_ok = diff <= atol
+    df_work["opv_match"] = rel_ok | abs_ok
+
+    mismatches = df_work.loc[~df_work["opv_match"]].copy()
+    mismatches["delta"] = mismatches["Original Price Value"] - mismatches["expected_original_price_value"]
+    return mismatches
+
+def fetch_orders_returns(
+    start_date: str,
+    end_date: str,
+    brand: str,
+    source_company: str,
+    order_numbers: list[str] | None = None,
+) -> pd.DataFrame:
+    """Fetch orders/returns with two modes:
+
+    - Default: date window by row_type (O uses invoice_creation_date, R uses credit_note_creation_date)
+    - If order_numbers provided (list), ignore dates and fetch rows by order_number instead.
+    """
+    is_fe = str(brand).strip().upper() == "FE"
+    if order_numbers and len(order_numbers) > 0:
+        # Normalize to strings for BQ
+        ids = [str(x).strip().upper() for x in order_numbers if str(x).strip()]
+        if not ids:
+            return pd.DataFrame()
+        sql = f"""
+            SELECT *
+            FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+            WHERE brand = @brand
+              {'' if is_fe else 'AND source_company = @source_company'}
+              AND UPPER(CAST(order_number AS STRING)) IN UNNEST(@order_numbers)
+        """
+        params = [
+            bigquery.ScalarQueryParameter("brand", "STRING", brand),
+            bigquery.ArrayQueryParameter("order_numbers", "STRING", ids),
+        ]
+        if not is_fe:
+            params.insert(1, bigquery.ScalarQueryParameter("source_company", "STRING", source_company))
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        return client.query(sql, job_config=job_config).to_dataframe()
+    else:
+        sql = f"""
+            SELECT *
+            FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+            WHERE brand = @brand
+              {'' if is_fe else 'AND source_company = @source_company'}
+              AND (
+                (row_type = 'O' AND DATE(invoice_creation_date) BETWEEN @start_date AND @end_date)
+                OR
+                (row_type = 'R' AND DATE(credit_note_creation_date) BETWEEN @start_date AND @end_date)
+              )
+        """
+        params = [
             bigquery.ScalarQueryParameter("brand", "STRING", brand),
             bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
             bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
-            bigquery.ScalarQueryParameter("source_company", "STRING", source_company),
         ]
-    )
-    return client.query(sql, job_config=job_config).to_dataframe()
+        if not is_fe:
+            params.append(bigquery.ScalarQueryParameter("source_company", "STRING", source_company))
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        return client.query(sql, job_config=job_config).to_dataframe()
 
 
 def fetch_brand_code(brand_input: str) -> Optional[str]:
@@ -615,8 +882,8 @@ def _parse_list_field(field: Any) -> list[str]:
     return parts
 
 
-from typing import Any, Optional
-import pandas as pd
+
+
 
 def apply_tlg_fee_config_per_row(
     df: pd.DataFrame,
@@ -636,41 +903,156 @@ def apply_tlg_fee_config_per_row(
         * location_code: match `OMS Location Name` unless '*' / blank
         * shipping_country inclusion/exclusion: honor lists unless '*'
         * endless_aisle (brand == 'CV'): match 0/1 if set; ignore if null/blank
-    - Thresholds: if present, pick row whose [min,max] contains the selected base (threshold_base or fee_calc_base).
-      If none match, fall back to no-threshold rows with a defined fee.
-    - Write only `recalc_%TLG FEE`. Do not change existing fee columns.
+    - Thresholds: if present, pick row whose [min,max] contains the selected base
+      (threshold_base or fee_calc_base). If none match, fall back to no-threshold
+      rows with a defined fee.
+    - Writes only `recalc_%TLG FEE`. Does not modify existing fee columns.
+
+    Notes / Fixes vs. previous version:
+    - Do NOT cast ARRAY columns to strings; keep them as lists from BigQuery.
+    - `_parse_list_field` is list-aware and tolerant of string forms (in case upstream changes).
+    - Excludes ARRAY columns from generic string normalization.
     """
+
     if df is None or df.empty or fee_config_df is None or fee_config_df.empty:
+        # Nothing to do; return original df unchanged
         return df
 
-    working = fee_config_df.copy()
+    # Work on copies to avoid mutating caller inputs
+    working = fee_config_df.copy(deep=True)
+    out = df.copy(deep=True)
 
-    # Normalize string-ish columns
-    for col in [
-        "brand", "location_code", "shipping_country_exclusion",
-        "shipping_country_inclusion", "erp_entity", "fee_calc_base",
-        "threshold_base", "endless_aisle"
-    ]:
-        if col in working.columns:
-            working[col] = working[col].astype(str).str.strip()
-
-    # Numerics
-    for col in ["fee_perc", "min_threshold_ytd", "max_threshold_ytd"]:
-        if col in working.columns:
-            working[col] = pd.to_numeric(working[col], errors="coerce")
-
-    # Treat null-like as NA so they behave as wildcards
+    # -----------------------------
+    # Helpers
+    # -----------------------------
     def _nullify(series: pd.Series) -> pd.Series:
+        """Treat common null-like sentinels as missing."""
         return series.replace(
             {"": pd.NA, "null": pd.NA, "None": pd.NA, "none": pd.NA, "NaN": pd.NA, "nan": pd.NA}
         )
 
-    for col in ["brand", "location_code", "shipping_country_exclusion", "shipping_country_inclusion", "erp_entity", "endless_aisle"]:
+    def _normalize_yes_no_flag(v: Any) -> Optional[int]:
+        """Map truthy/falsey flags to 1/0; return None if not parseable."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        s = str(v).strip().upper()
+        if s in {"1", "Y", "YES", "TRUE", "T"}:
+            return 1
+        if s in {"0", "N", "NO", "FALSE", "F"}:
+            return 0
+        return None
+
+    def _as_upper_list(xs: Iterable[Any]) -> list[str]:
+        return [str(x).strip().upper() for x in xs if str(x).strip()]
+
+    def _parse_list_field(x: Any) -> list[str]:
+        """
+        Robustly parse array-ish fields.
+        - If list/tuple -> normalize & uppercase
+        - If contains '*' anywhere -> wildcard ['*']
+        - If string representation of list or delimited -> parse gracefully
+        - Returns [] for blank/NA
+        """
+        import ast, re
+
+        # Pass-through for None/NaN
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return []
+
+        # If it's already a sequence, normalize
+        if isinstance(x, (list, tuple)):
+            vals = _as_upper_list(x)
+            return ["*"] if any(v == "*" for v in vals) else vals
+
+        s = str(x).strip()
+        if not s:
+            return []
+        if "*" in s:
+            return ["*"]
+
+        # Try literal list formats first: '["US","IT"]', "['US','IT']"
+        try:
+            lit = ast.literal_eval(s)
+            if isinstance(lit, (list, tuple)):
+                return _as_upper_list(lit)
+        except Exception:
+            pass
+
+        # Fallback: strip surrounding []/() and split by comma/semicolon/whitespace runs
+        s = re.sub(r"^[\[\(](.*)[\]\)]$", r"\1", s).strip()
+        parts = re.split(r"[;,]\s*|\s{2,}", s)
+        parts = [p.strip().strip("'\"") for p in parts if p.strip().strip("'\"")]
+        return [p.upper() for p in parts]
+
+    def _erp_ok(cfg_val: Any, ent: Optional[str]) -> bool:
+        if ent is None or (isinstance(ent, float) and pd.isna(ent)) or str(ent).strip() == "":
+            return True
+        if pd.isna(cfg_val):
+            return True
+        s = str(cfg_val).strip()
+        return s == "*" or s.upper() == str(ent).strip().upper()
+
+    def _brand_ok(cfg_val: Any, b: str) -> bool:
+        if pd.isna(cfg_val):
+            return True
+        s = str(cfg_val).strip()
+        return s == "*" or s.upper() == str(b).strip().upper()
+
+    def _loc_ok(cfg_val: Any, omsv: Optional[str]) -> bool:
+        if pd.isna(cfg_val):
+            return True
+        s = str(cfg_val).strip()
+        if s == "*":
+            return True
+        if omsv is None or (isinstance(omsv, float) and pd.isna(omsv)) or str(omsv).strip() == "":
+            return False
+        return s.upper() == str(omsv).strip().upper()
+
+    def _ship_match(incl_list: list[str], excl_list: list[str], ship_val: str) -> bool:
+        """Inclusion beats exclusion; '*' in either list is wildcard (no restriction)."""
+        incl = list(incl_list) if isinstance(incl_list, (list, tuple)) else []
+        excl = list(excl_list) if isinstance(excl_list, (list, tuple)) else []
+        ship = (ship_val or "").strip().upper()
+
+        # Wildcard in inclusion => no restriction
+        if incl and incl == ["*"]:
+            incl = []
+
+        # Wildcard in exclusion => no restriction
+        if excl and excl == ["*"]:
+            excl = []
+
+        if incl:
+            if ship not in set(incl):
+                return False
+        if excl:
+            if ship in set(excl):
+                return False
+        return True
+
+    # -----------------------------
+    # Normalize config
+    # -----------------------------
+
+    # 1) String-ish columns (EXCLUDE ARRAY columns so we don't coerce lists to strings)
+    stringish_cols = [
+        "brand", "location_code", "erp_entity", "fee_calc_base", "threshold_base", "endless_aisle"
+    ]
+    for col in stringish_cols:
+        if col in working.columns:
+            working[col] = working[col].astype("string").str.strip()
+
+    # 2) Numeric columns
+    for col in ["fee_perc", "min_threshold_ytd", "max_threshold_ytd"]:
+        if col in working.columns:
+            working[col] = pd.to_numeric(working[col], errors="coerce")
+
+    # 3) Null-like to NA for stringish matching columns
+    for col in ["brand", "location_code", "erp_entity", "endless_aisle"]:
         if col in working.columns:
             working[col] = _nullify(working[col])
 
-
-    # Pre-parse inclusion/exclusion lists
+    # 4) Inclusion/Exclusion ARRAY columns: keep lists if they already are; parse if strings
     if "shipping_country_inclusion" in working.columns:
         working["_incl_list"] = working["shipping_country_inclusion"].apply(_parse_list_field)
     else:
@@ -681,59 +1063,20 @@ def apply_tlg_fee_config_per_row(
     else:
         working["_excl_list"] = [[] for _ in range(len(working))]
 
-    print(working)
-
+    # -----------------------------
     # Static YTD bases
+    # -----------------------------
     ytd_gmv = float(static_ytd_gmv or 0.0)
     ytd_nmv = float(static_ytd_nmv or 0.0)
 
     print(ytd_gmv)
     print(ytd_nmv)
 
-    # Helpers
-    def _erp_ok(x: Any, ent: Optional[str]) -> bool:
-        if ent is None or (isinstance(ent, float) and pd.isna(ent)) or str(ent).strip() == "":
-            return True
-        if pd.isna(x):
-            return True
-        s = str(x).strip()
-        return s == "*" or s.upper() == str(ent).strip().upper()
-
-    def _brand_ok(x: Any, b: str) -> bool:
-        if pd.isna(x):
-            return True
-        s = str(x).strip()
-        return s == "*" or s.upper() == str(b).strip().upper()
-
-    def _loc_ok(x: Any, omsv: Optional[str]) -> bool:
-        if pd.isna(x):
-            return True
-        s = str(x).strip()
-        if s == "*":
-            return True
-        if omsv is None or (isinstance(omsv, float) and pd.isna(omsv)) or str(omsv).strip() == "":
-            return False
-        return s.upper() == str(omsv).strip().upper()
-
-    def _ship_match(incl_list: list[str], excl_list: list[str], ship_val: str) -> bool:
-        # Guard to avoid elementwise warnings; coerce to Python list/set
-        incl = list(incl_list) if isinstance(incl_list, (list, tuple)) else []
-        excl = list(excl_list) if isinstance(excl_list, (list, tuple)) else []
-        ship = (ship_val or "").strip().upper()
-
-        if incl and incl != ["*"]:
-            # set lookup for speed
-            if ship not in set(incl):
-                return False
-        if excl and excl != ["*"]:
-            if ship in set(excl):
-                return False
-        return True
 
     def _threshold_ok(cfg_row: pd.Series) -> bool:
         min_thr = cfg_row.get("min_threshold_ytd")
         max_thr = cfg_row.get("max_threshold_ytd")
-        base = str(cfg_row.get("threshold_base") or cfg_row.get("fee_calc_base") or "").strip().upper()
+        base = str(cfg_row.get("threshold_base")).strip().upper()
         if pd.isna(min_thr) and pd.isna(max_thr):
             return False
         value = ytd_gmv if base == "GMV" else ytd_nmv if base == "NMV" else ytd_gmv
@@ -744,46 +1087,53 @@ def apply_tlg_fee_config_per_row(
         except Exception:
             return False
 
-    out = df.copy(deep=False)
-    # Normalized per-row fields
-    out["_ship"] = out.get("Shipping Country", pd.Series(index=out.index)).astype(str).str.strip().str.upper()
+    # -----------------------------
+    # Prepare transaction rows
+    # -----------------------------
+    out["_ship"] = (
+        out.get("Shipping Country", pd.Series(index=out.index))
+        .astype("string").str.strip().str.upper()
+    )
+
     if "OMS Location Name" in out.columns:
-        out["_oms"] = out["OMS Location Name"].astype(str).str.strip().str.upper()
+        out["_oms"] = out["OMS Location Name"].astype("string").str.strip().str.upper()
     else:
-        out["_oms"] = None
+        out["_oms"] = pd.Series([None] * len(out), index=out.index)
 
     cv_brand = (str(brand).strip().upper() == "CV")
     if cv_brand and "Endless Aisle" in out.columns:
         out["_ea"] = out["Endless Aisle"].apply(_normalize_yes_no_flag)
     else:
-        out["_ea"] = None
+        out["_ea"] = pd.Series([None] * len(out), index=out.index)
 
-    print(out)
-
+    # -----------------------------
+    # Row-wise matching & fee selection
+    # -----------------------------
     perc_values: list[float | None] = []
 
+    # for _, row in out.iterrows():
     for _, row in out.iterrows():
+
         ship = row.get("_ship") or ""
         omsv = row.get("_oms")
         endless_val = row.get("_ea")
 
         cand = working
 
-        # Brand filter (with wildcard/blank support)
-        if "brand" in cand.columns:
-            cand = cand[cand["brand"].apply(lambda x: _brand_ok(x, brand))]
-
         # ERP entity
         if "erp_entity" in cand.columns:
             cand = cand[cand["erp_entity"].apply(lambda x: _erp_ok(x, erp_entity))]
 
+
         # Location
-        if "location_code" in cand.columns:
+        if "location_code" in cand.columns and omsv:
             cand = cand[cand["location_code"].apply(lambda x: _loc_ok(x, omsv))]
+
 
         # Shipping include/exclude
         if "_incl_list" in cand.columns and "_excl_list" in cand.columns:
             cand = cand[cand.apply(lambda r: _ship_match(r["_incl_list"], r["_excl_list"], ship), axis=1)]
+        
 
         # Endless Aisle (only for CV brand)
         if cv_brand and "endless_aisle" in cand.columns:
@@ -796,9 +1146,11 @@ def apply_tlg_fee_config_per_row(
                 if endless_val is None:
                     return False
                 return int(cfg_flag) == int(endless_val)
+
             cand = cand[cand["endless_aisle"].apply(endless_ok)]
 
         fee = None
+        selected_row = None
         if not cand.empty:
             # Prefer matching threshold rows
             with_thr = cand[cand.apply(_threshold_ok, axis=1)].copy()
@@ -806,7 +1158,9 @@ def apply_tlg_fee_config_per_row(
                 with_thr["_low"] = with_thr["min_threshold_ytd"].fillna(0.0)
                 # deterministic tie-break: lowest min_threshold then highest fee
                 with_thr = with_thr.sort_values(by=["_low", "fee_perc"], ascending=[True, False])
-                fee = with_thr.iloc[0].get("fee_perc")
+                selected_row = with_thr.iloc[0]
+                fee = selected_row.get("fee_perc")
+
             else:
                 # Fallback: rows without thresholds (or any with a fee)
                 no_thr = cand[(cand["min_threshold_ytd"].isna()) & (cand["max_threshold_ytd"].isna())]
@@ -814,14 +1168,55 @@ def apply_tlg_fee_config_per_row(
                 pool = pool.dropna(subset=["fee_perc"]).copy()
                 if not pool.empty:
                     pool = pool.sort_values(by=["fee_perc"], ascending=[False])
-                    fee = pool.iloc[0].get("fee_perc")
+                    selected_row = pool.iloc[0]
+                    fee = selected_row.get("fee_perc")
 
-        perc_values.append(float(fee) if fee is not None and not pd.isna(fee) else None)
+        # -----------------------------
+        # Apply GMV/NMV base & returns rules
+        # -----------------------------
+        applied_fee = fee
+
+        # Detect returns robustly
+        try:
+            row_type_val = str(row.get("Row Type", "")).strip().upper()
+        except Exception:
+            row_type_val = ""
+        try:
+            type_text = str(row.get("Type", "")).strip().upper()
+        except Exception:
+            type_text = ""
+        qty_val = pd.to_numeric(row.get("Qty"), errors="coerce") if "Qty" in row.index else pd.NA
+
+        is_return = False
+        if row_type_val == "R":
+            is_return = True
+        elif any(k in type_text for k in ["CREDIT", "CREDITO", "NOTA"]):
+            # Handle 'Credit Note' / 'Nota di Credito'
+            is_return = True
+        elif pd.notna(qty_val) and float(qty_val) < 0:
+            is_return = True
+
+        if is_return:
+            applied_fee = 0.0 if applied_fee is not None else 0.0
+        else:
+            # Only gate on Qualità Reso. when fee_calc_base is NMV
+            if selected_row is not None:
+                calc_base = str(selected_row.get("fee_calc_base") or "").strip().upper()
+            else:
+                calc_base = ""
+
+            if calc_base == "NMV":
+                qreso = pd.to_numeric(row.get("Qualità Reso."), errors="coerce") if "Qualità Reso." in row.index else 0.0
+                # Apply the TLG fee only if Qualità Reso. equals 0
+                if pd.notna(qreso) and float(qreso) != 0.0:
+                    applied_fee = 0.0 if applied_fee is not None else 0.0
+
+        perc_values.append(float(applied_fee) if applied_fee is not None and not pd.isna(applied_fee) else None)
 
     out["recalc_%TLG FEE"] = pd.Series(perc_values, index=out.index)
 
-    # cleanup temp cols
-    out = out.drop(columns=[c for c in ["_ship", "_oms", "_ea"] if c in out.columns])
+    # Cleanup temp cols
+    out = out.drop(columns=[c for c in ["_ship", "_oms", "_ea"] if c in out.columns], errors="ignore")
     return out
 
 

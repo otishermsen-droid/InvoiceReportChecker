@@ -10,6 +10,7 @@ from common import (
     decide_fee_percent_from_config,
     fetch_ytd_totals_until_date,
     apply_tlg_fee_config_per_row,
+    fetch_orders_returns,
 )
 
 st.set_page_config(page_title="File Upload", layout="wide")
@@ -115,6 +116,63 @@ if uploaded_file is not None and brand:
                 static_ytd_gmv=initial_gmv,
                 static_ytd_nmv=initial_nmv,
             )
+        except Exception:
+            pass
+
+        # FE-only: enrich Gross price from BI on upload time
+        try:
+            if isinstance(brand, str) and brand.strip().upper() == "FE":
+                start_dt = st.session_state.get("validation_start_date")
+                end_dt = st.session_state.get("validation_end_date")
+                if start_dt and end_dt and erpEntity:
+                    start_str = start_dt.strftime("%Y-%m-%d")
+                    end_str = end_dt.strftime("%Y-%m-%d")
+                    # Build unique order_numbers from CSV to fetch outside timeframe if needed
+                    order_numbers = []
+                    if "Order Number" in df.columns:
+                        order_numbers = (
+                            df["Order Number"].astype(str).str.strip().str.upper().dropna().unique().tolist()
+                        )
+                    bq_df = fetch_orders_returns(start_str, end_str, brand, erpEntity, order_numbers=order_numbers)
+                    if bq_df is not None and not bq_df.empty:
+                        if "channel" in bq_df.columns:
+                            bq_df = bq_df[bq_df["channel"].astype(str).str.strip().str.upper() == "B2C"]
+                        # Always take gross_price from Orders rows (row_type = 'O')
+                        if "row_type" in bq_df.columns:
+                            bq_df = bq_df[bq_df["row_type"].astype(str).str.strip().str.upper() == "O"]
+                        # Build keys (include row_type mapping: CSV Type S->O, R->R)
+                        if "Order Number" in df.columns:
+                            df["_order_key"] = df["Order Number"].astype(str).str.strip().str.upper()
+                        else:
+                            df["_order_key"] = pd.Series([None] * len(df), index=df.index)
+                        if "EAN" in df.columns:
+                            df["_ean_key"] = df["EAN"].astype(str).str.strip().str.upper()
+                        else:
+                            df["_ean_key"] = pd.Series([None] * len(df), index=df.index)
+                        bq_df["_order_key"] = bq_df["order_number"].astype(str).str.strip().str.upper() if "order_number" in bq_df.columns else pd.Series([], dtype=str)
+                        if "product_id" in bq_df.columns:
+                            bq_df["_ean_key"] = bq_df["product_id"].astype(str).str.strip().str.upper().str.replace(r"^48", "", regex=True)
+                        else:
+                            bq_df["_ean_key"] = pd.Series([], dtype=str)
+
+                        if "gross_price" in bq_df.columns:
+                            bq_small = (
+                                bq_df[["_order_key", "_ean_key", "gross_price", "discount"]]
+                                .dropna(subset=["_order_key", "_ean_key"])
+                                .sort_values(["_order_key", "_ean_key"])
+                                .drop_duplicates(subset=["_order_key", "_ean_key"], keep="first")
+                            )
+                            df = df.merge(
+                                bq_small,
+                                how="left",
+                                left_on=["_order_key", "_ean_key"],
+                                right_on=["_order_key", "_ean_key"],
+                                suffixes=("", "_bq"),
+                            )
+                            df["Gross price"] = pd.to_numeric(df.get("gross_price"), errors="coerce")
+                            if "discount" in df.columns:
+                                df["discount"] = pd.to_numeric(df.get("discount"), errors="coerce")
+                            df = df.drop(columns=[c for c in ["_order_key", "_ean_key", "gross_price"] if c in df.columns])
         except Exception:
             pass
 
