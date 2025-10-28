@@ -9,6 +9,7 @@ from common import (
     fetch_ytd_totals_for_brand,
     decide_fee_percent_from_config,
     fetch_ytd_totals_until_date,
+    fetch_reset_aware_totals,
     apply_tlg_fee_config_per_row,
     fetch_orders_returns,
 )
@@ -90,19 +91,21 @@ if uploaded_file is not None and brand:
         else:
             ytd_totals_df = st.session_state.ytd_totals[brand]
 
-        # Seed running totals until chosen start date
+        # Seed running totals until chosen start date, reset-aware
         initial_gmv = 0.0
         initial_nmv = 0.0
         try:
             if st.session_state.validation_start_date is not None:
-                ytd_until = fetch_ytd_totals_until_date(
+                start_str = st.session_state.validation_start_date.strftime("%Y-%m-%d")
+                end_str = st.session_state.validation_end_date.strftime("%Y-%m-%d") if st.session_state.validation_end_date is not None else start_str
+                gmv_val, nmv_val = fetch_reset_aware_totals(
                     brand=brand,
-                    end_date=st.session_state.validation_start_date.strftime("%Y-%m-%d"),
+                    period_start_date=start_str,
+                    period_end_date=end_str,
                 )
-                if ytd_until is not None and not ytd_until.empty:
-                    last = ytd_until.iloc[-1]
-                    initial_gmv = float(pd.to_numeric(last.get("total_gmv_eur"), errors="coerce") or 0.0)
-                    initial_nmv = float(pd.to_numeric(last.get("total_nmv_eur"), errors="coerce") or 0.0)
+                initial_gmv = float(gmv_val or 0.0)
+                initial_nmv = float(nmv_val or 0.0)
+                print(initial_gmv, initial_nmv)
         except Exception:
             pass
 
@@ -116,6 +119,8 @@ if uploaded_file is not None and brand:
                 static_ytd_gmv=initial_gmv,
                 static_ytd_nmv=initial_nmv,
             )
+            print(df["recalc_%TLG FEE"].notna().sum(), "non-null fees")
+            print(df[["recalc_%TLG FEE"]].head())
         except Exception:
             pass
 

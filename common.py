@@ -318,6 +318,18 @@ def load_invoicing_report(file: Union[io.BytesIO, str], brand: Optional[str] = N
         "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2"
     ]
     df = _coerce_numeric(df, num_cols)
+
+    # HE-specific: scale selected columns by dividing by 100 for internal use
+    if brand_key == "HE":
+        he_cols = [
+            "Qty", "% Tax", "Original Price", "Sell Price", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2", "COGS x Qty"
+        ]
+        for c in he_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce") / 100.0
+        # Exchange rate uses a different scaling factor
+        if "Exchange rate" in df.columns:
+            df["Exchange rate"] = pd.to_numeric(df["Exchange rate"], errors="coerce") / 100000.0
     return df
 
 # to fix TLG FEE
@@ -346,14 +358,17 @@ def sanity_check_tlg_fee(
         source_col = "recalc_%TLG FEE" if "recalc_%TLG FEE" in df.columns else "% TLG FEE"
         # Use 0 instead of NA for zero/blank percents
         percent_series = df[source_col]
-        
-        # Handle different formats: recalc_%TLG FEE is in decimal (0.15), % TLG FEE is in percentage (15)
+
+        # HE brand: values were divided by 100 on load, so % TLG FEE is already decimal
+        brand_key = st.session_state.get("brand") if "brand" in st.session_state else None
+        he_decimal_mode = isinstance(brand_key, str) and brand_key.strip().upper() == "HE"
+
+        # Handle different formats
         if source_col == "recalc_%TLG FEE":
-            # recalc_%TLG FEE is already in decimal format, no conversion needed
+            # recalc_%TLG FEE is already in decimal format
             pass
         else:
-            # % TLG FEE is in percentage format, convert to decimal
-            percent_series = percent_series / 100
+            percent_series = percent_series if he_decimal_mode else (percent_series / 100)
 
     # Ensure missing percents or GMV yield expected fee of 0 (not NaN)
     df["expected_tlg_fee"] = (
@@ -535,7 +550,20 @@ def sanity_check_gmv_net(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
         return pd.DataFrame()
     _coerce_numeric(df, req)
     percent = df[tax_col].fillna(0)
-    df["expected_gmv_net"] = df["GMV EUR"] / (1 + percent / 100)
+    # HE brand: % Tax was divided by 100 on load → already decimal
+    try:
+        brand_key = st.session_state.get("brand")
+    except Exception:
+        brand_key = None
+    he_decimal_mode = isinstance(brand_key, str) and brand_key.strip().upper() == "HE"
+    if not he_decimal_mode:
+        percent = percent
+    else:
+        # already decimal, no conversion
+        pass
+    # If HE: percent is decimal; otherwise convert from percentage
+    divisor = (1 + (percent if he_decimal_mode else (percent / 100)))
+    df["expected_gmv_net"] = df["GMV EUR"] / divisor
     diff = (df["GMV Net VAT"] - df["expected_gmv_net"]).abs()
     rel_ok = diff <= (df["expected_gmv_net"].abs() * rtol)
     abs_ok = diff <= atol
@@ -739,7 +767,8 @@ def fetch_tlg_fee_config(brand: str) -> pd.DataFrame:
           CAST(min_threshold_ytd AS FLOAT64) AS min_threshold_ytd,
           CAST(max_threshold_ytd AS FLOAT64) AS max_threshold_ytd,
           endless_aisle,
-          currency
+          currency,
+          reset_date
         FROM `{BQ_PROJECT}.config.brand_fee`
         WHERE UPPER(TRIM(brand)) = UPPER(@brand)
     """
@@ -921,7 +950,6 @@ def apply_tlg_fee_config_per_row(
     # Work on copies to avoid mutating caller inputs
     working = fee_config_df.copy(deep=True)
     out = df.copy(deep=True)
-
     # -----------------------------
     # Helpers
     # -----------------------------
@@ -947,42 +975,41 @@ def apply_tlg_fee_config_per_row(
 
     def _parse_list_field(x: Any) -> list[str]:
         """
-        Robustly parse array-ish fields.
-        - If list/tuple -> normalize & uppercase
-        - If contains '*' anywhere -> wildcard ['*']
-        - If string representation of list or delimited -> parse gracefully
+        Parse comma-separated values only.
+        - Accept list/tuple by normalizing and uppercasing
+        - Accept strings like "A,B,C" or "[A,B,C]" (optional brackets)
+        - If '*' appears anywhere in the string, treat as wildcard ['*']
         - Returns [] for blank/NA
         """
-        import ast, re
-
-        # Pass-through for None/NaN
         if x is None or (isinstance(x, float) and pd.isna(x)):
             return []
 
-        # If it's already a sequence, normalize
         if isinstance(x, (list, tuple)):
             vals = _as_upper_list(x)
             return ["*"] if any(v == "*" for v in vals) else vals
+
+        # Numpy/pandas array-like: use tolist()
+        if hasattr(x, "tolist") and not isinstance(x, (str, bytes)):
+            try:
+                seq = x.tolist()
+                if not isinstance(seq, (list, tuple)):
+                    seq = [seq]
+                vals = _as_upper_list(seq)
+                return ["*"] if any(v == "*" for v in vals) else vals
+            except Exception:
+                pass
 
         s = str(x).strip()
         if not s:
             return []
         if "*" in s:
             return ["*"]
-
-        # Try literal list formats first: '["US","IT"]', "['US','IT']"
-        try:
-            lit = ast.literal_eval(s)
-            if isinstance(lit, (list, tuple)):
-                return _as_upper_list(lit)
-        except Exception:
-            pass
-
-        # Fallback: strip surrounding []/() and split by comma/semicolon/whitespace runs
-        s = re.sub(r"^[\[\(](.*)[\]\)]$", r"\1", s).strip()
-        parts = re.split(r"[;,]\s*|\s{2,}", s)
-        parts = [p.strip().strip("'\"") for p in parts if p.strip().strip("'\"")]
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+            s = s[1:-1].strip()
+        parts = [p.strip().strip("'\"") for p in s.split(",")]
+        parts = [p for p in parts if p]
         return [p.upper() for p in parts]
+
 
     def _erp_ok(cfg_val: Any, ent: Optional[str]) -> bool:
         if ent is None or (isinstance(ent, float) and pd.isna(ent)) or str(ent).strip() == "":
@@ -999,14 +1026,18 @@ def apply_tlg_fee_config_per_row(
         return s == "*" or s.upper() == str(b).strip().upper()
 
     def _loc_ok(cfg_val: Any, omsv: Optional[str]) -> bool:
-        if pd.isna(cfg_val):
-            return True
-        s = str(cfg_val).strip()
-        if s == "*":
-            return True
+        # Must have an OMSV to match against
         if omsv is None or (isinstance(omsv, float) and pd.isna(omsv)) or str(omsv).strip() == "":
             return False
-        return s.upper() == str(omsv).strip().upper()
+        raw = "" if cfg_val is None or (isinstance(cfg_val, float) and pd.isna(cfg_val)) else str(cfg_val)
+        if not raw:
+            # Empty config means no restriction
+            return True
+        # Wildcard allows all
+        if "*" in raw:
+            return True
+        # SQL LIKE-style substring match (case-insensitive)
+        return str(omsv).strip().upper() in raw.strip().upper()
 
     def _ship_match(incl_list: list[str], excl_list: list[str], ship_val: str) -> bool:
         """Inclusion beats exclusion; '*' in either list is wildcard (no restriction)."""
@@ -1036,7 +1067,7 @@ def apply_tlg_fee_config_per_row(
 
     # 1) String-ish columns (EXCLUDE ARRAY columns so we don't coerce lists to strings)
     stringish_cols = [
-        "brand", "location_code", "erp_entity", "fee_calc_base", "threshold_base", "endless_aisle"
+        "brand", "erp_entity", "fee_calc_base", "threshold_base", "endless_aisle"
     ]
     for col in stringish_cols:
         if col in working.columns:
@@ -1046,11 +1077,11 @@ def apply_tlg_fee_config_per_row(
     for col in ["fee_perc", "min_threshold_ytd", "max_threshold_ytd"]:
         if col in working.columns:
             working[col] = pd.to_numeric(working[col], errors="coerce")
-
     # 3) Null-like to NA for stringish matching columns
-    for col in ["brand", "location_code", "erp_entity", "endless_aisle"]:
+    for col in ["brand", "erp_entity", "endless_aisle"]:
         if col in working.columns:
             working[col] = _nullify(working[col])
+
 
     # 4) Inclusion/Exclusion ARRAY columns: keep lists if they already are; parse if strings
     if "shipping_country_inclusion" in working.columns:
@@ -1062,15 +1093,13 @@ def apply_tlg_fee_config_per_row(
         working["_excl_list"] = working["shipping_country_exclusion"].apply(_parse_list_field)
     else:
         working["_excl_list"] = [[] for _ in range(len(working))]
+    
 
     # -----------------------------
     # Static YTD bases
     # -----------------------------
     ytd_gmv = float(static_ytd_gmv or 0.0)
     ytd_nmv = float(static_ytd_nmv or 0.0)
-
-    print(ytd_gmv)
-    print(ytd_nmv)
 
 
     def _threshold_ok(cfg_row: pd.Series) -> bool:
@@ -1109,114 +1138,115 @@ def apply_tlg_fee_config_per_row(
     # -----------------------------
     # Row-wise matching & fee selection
     # -----------------------------
-    perc_values: list[float | None] = []
+    # Initialize target column so we can assign per-row safely
+    out["recalc_%TLG FEE"] = pd.Series([pd.NA] * len(out), index=out.index)
 
     # for _, row in out.iterrows():
     for _, row in out.iterrows():
+        try:
+            ship = row.get("_ship") or ""
+            omsv = row.get("_oms")
+            endless_val = row.get("_ea")
 
-        ship = row.get("_ship") or ""
-        omsv = row.get("_oms")
-        endless_val = row.get("_ea")
+            cand = working
 
-        cand = working
+            # ERP entity
+            if "erp_entity" in cand.columns:
+                cand = cand[cand["erp_entity"].apply(lambda x: _erp_ok(x, erp_entity))]
 
-        # ERP entity
-        if "erp_entity" in cand.columns:
-            cand = cand[cand["erp_entity"].apply(lambda x: _erp_ok(x, erp_entity))]
+            # Location
+            if "location_code" in cand.columns and omsv:
+                cand = cand[cand["location_code"].apply(lambda x: _loc_ok(x, omsv))]
 
+            # Shipping include/exclude
+            if "_incl_list" in cand.columns and "_excl_list" in cand.columns:
+                cand = cand[cand.apply(lambda r: _ship_match(r["_incl_list"], r["_excl_list"], ship), axis=1)]
+            
+            # Endless Aisle (only for CV brand)
+            if cv_brand and "endless_aisle" in cand.columns:
+                def endless_ok(x: Any) -> bool:
+                    if pd.isna(x) or str(x).strip() == "":
+                        return True
+                    cfg_flag = _normalize_yes_no_flag(x)
+                    if cfg_flag is None:
+                        return True
+                    if endless_val is None:
+                        return False
+                    return int(cfg_flag) == int(endless_val)
 
-        # Location
-        if "location_code" in cand.columns and omsv:
-            cand = cand[cand["location_code"].apply(lambda x: _loc_ok(x, omsv))]
+                cand = cand[cand["endless_aisle"].apply(endless_ok)]
 
-
-        # Shipping include/exclude
-        if "_incl_list" in cand.columns and "_excl_list" in cand.columns:
-            cand = cand[cand.apply(lambda r: _ship_match(r["_incl_list"], r["_excl_list"], ship), axis=1)]
-        
-
-        # Endless Aisle (only for CV brand)
-        if cv_brand and "endless_aisle" in cand.columns:
-            def endless_ok(x: Any) -> bool:
-                if pd.isna(x) or str(x).strip() == "":
-                    return True
-                cfg_flag = _normalize_yes_no_flag(x)
-                if cfg_flag is None:
-                    return True
-                if endless_val is None:
-                    return False
-                return int(cfg_flag) == int(endless_val)
-
-            cand = cand[cand["endless_aisle"].apply(endless_ok)]
-
-        fee = None
-        selected_row = None
-        if not cand.empty:
-            # Prefer matching threshold rows
-            with_thr = cand[cand.apply(_threshold_ok, axis=1)].copy()
-            if not with_thr.empty:
-                with_thr["_low"] = with_thr["min_threshold_ytd"].fillna(0.0)
-                # deterministic tie-break: lowest min_threshold then highest fee
-                with_thr = with_thr.sort_values(by=["_low", "fee_perc"], ascending=[True, False])
-                selected_row = with_thr.iloc[0]
-                fee = selected_row.get("fee_perc")
-
-            else:
-                # Fallback: rows without thresholds (or any with a fee)
-                no_thr = cand[(cand["min_threshold_ytd"].isna()) & (cand["max_threshold_ytd"].isna())]
-                pool = no_thr if not no_thr.empty else cand
-                pool = pool.dropna(subset=["fee_perc"]).copy()
-                if not pool.empty:
-                    pool = pool.sort_values(by=["fee_perc"], ascending=[False])
-                    selected_row = pool.iloc[0]
+            fee = None
+            selected_row = None
+            if not cand.empty:
+                # Prefer matching threshold rows
+                with_thr = cand[cand.apply(_threshold_ok, axis=1)].copy()
+                if not with_thr.empty:
+                    with_thr["_low"] = with_thr["min_threshold_ytd"].fillna(0.0)
+                    # deterministic tie-break: lowest min_threshold then highest fee
+                    with_thr = with_thr.sort_values(by=["_low", "fee_perc"], ascending=[True, False])
+                    selected_row = with_thr.iloc[0]
                     fee = selected_row.get("fee_perc")
 
-        # -----------------------------
-        # Apply GMV/NMV base & returns rules
-        # -----------------------------
-        applied_fee = fee
+                else:
+                    # Fallback: rows without thresholds (or any with a fee)
+                    no_thr = cand[(cand["min_threshold_ytd"].isna()) & (cand["max_threshold_ytd"].isna())]
+                    pool = no_thr if not no_thr.empty else cand
+                    pool = pool.dropna(subset=["fee_perc"]).copy()
+                    if not pool.empty:
+                        pool = pool.sort_values(by=["fee_perc"], ascending=[False])
+                        selected_row = pool.iloc[0]
+                        fee = selected_row.get("fee_perc")
 
-        # Detect returns robustly
-        try:
-            row_type_val = str(row.get("Row Type", "")).strip().upper()
-        except Exception:
-            row_type_val = ""
-        try:
-            type_text = str(row.get("Type", "")).strip().upper()
-        except Exception:
-            type_text = ""
-        qty_val = pd.to_numeric(row.get("Qty"), errors="coerce") if "Qty" in row.index else pd.NA
+            # -----------------------------
+            # Apply GMV/NMV base & returns rules
+            # -----------------------------
+            applied_fee = fee
 
-        is_return = False
-        if row_type_val == "R":
-            is_return = True
-        elif any(k in type_text for k in ["CREDIT", "CREDITO", "NOTA"]):
-            # Handle 'Credit Note' / 'Nota di Credito'
-            is_return = True
-        elif pd.notna(qty_val) and float(qty_val) < 0:
-            is_return = True
+            # Detect returns robustly
+            try:
+                row_type_val = str(row.get("Row Type", "")).strip().upper()
+            except Exception:
+                row_type_val = ""
+            try:
+                type_text = str(row.get("Type", "")).strip().upper()
+            except Exception:
+                type_text = ""
+            qty_val = pd.to_numeric(row.get("Qty"), errors="coerce") if "Qty" in row.index else pd.NA
 
-        if is_return:
-            applied_fee = 0.0 if applied_fee is not None else 0.0
-        else:
-            # Only gate on Qualità Reso. when fee_calc_base is NMV
-            if selected_row is not None:
-                calc_base = str(selected_row.get("fee_calc_base") or "").strip().upper()
+            is_return = False
+            if cv_brand and type_text == "RETURN":
+                is_return = True
+            elif row_type_val == "R":
+                is_return = True
+            elif any(k in type_text for k in ["CREDIT", "CREDITO", "NOTA"]):
+                # Handle 'Credit Note' / 'Nota di Credito'
+                is_return = True
+            elif pd.notna(qty_val) and float(qty_val) < 0:
+                is_return = True
+
+            if is_return:
+                applied_fee = 0.0 if applied_fee is not None else 0.0
             else:
-                calc_base = ""
+                # Only gate on Qualità Reso. when fee_calc_base is NMV
+                if selected_row is not None:
+                    calc_base = str(selected_row.get("fee_calc_base") or "").strip().upper()
+                else:
+                    calc_base = ""
 
-            if calc_base == "NMV":
-                qreso = pd.to_numeric(row.get("Qualità Reso."), errors="coerce") if "Qualità Reso." in row.index else 0.0
-                # Apply the TLG fee only if Qualità Reso. equals 0
-                if pd.notna(qreso) and float(qreso) != 0.0:
-                    applied_fee = 0.0 if applied_fee is not None else 0.0
+                if calc_base == "NMV":
+                    qreso = pd.to_numeric(row.get("Qualità Reso."), errors="coerce") if "Qualità Reso." in row.index else 0.0
+                    # Apply the TLG fee only if Qualità Reso. equals 0
+                    if pd.notna(qreso) and float(qreso) != 0.0:
+                        applied_fee = 0.0 if applied_fee is not None else 0.0
 
-        perc_values.append(float(applied_fee) if applied_fee is not None and not pd.isna(applied_fee) else None)
-
-    out["recalc_%TLG FEE"] = pd.Series(perc_values, index=out.index)
-
+            value = float(applied_fee) if applied_fee is not None and not pd.isna(applied_fee) else None
+            out.at[row.name, "recalc_%TLG FEE"] = value
+        except Exception as e:
+            print("apply_tlg_fee row error", row.name, type(e).__name__, e)
     # Cleanup temp cols
     out = out.drop(columns=[c for c in ["_ship", "_oms", "_ea"] if c in out.columns], errors="ignore")
+    print(out)
     return out
 
 
@@ -1258,3 +1288,92 @@ def fetch_ytd_totals_until_date(brand: str, end_date: str) -> pd.DataFrame:
         ]
     )
     return client.query(sql, job_config=job_config).to_dataframe()
+
+
+def fetch_reset_aware_totals(
+    brand: str,
+    period_start_date: str,
+    period_end_date: str,
+) -> Tuple[float, float]:
+    """Compute GMV/NMV totals from the brand reset_date month/day up to period_start_date.
+
+    Rules:
+    - Use `config.brand_fee.reset_date` month and day, ignore its year.
+    - Determine the most recent reset boundary on/before period_start_date.
+    - Sum orders/returns between that boundary (inclusive) and the day before period_start_date.
+    - Return (gmv_sum, nmv_sum) as floats; if no rows, (0.0, 0.0).
+    - If reset_date missing, fall back to calendar YTD logic using Jan 1 of period_start_date year.
+    """
+    # 1) Fetch reset_date (could be multiple config rows; take first non-null)
+    cfg = fetch_tlg_fee_config(brand)
+    reset_ts: Optional[pd.Timestamp] = None
+    if cfg is not None and not cfg.empty and "reset_date" in cfg.columns:
+        try:
+            # Normalize to pandas Timestamp; pick first non-null
+            col = pd.to_datetime(cfg["reset_date"], errors="coerce")
+            col = col.dropna()
+            if not col.empty:
+                reset_ts = pd.to_datetime(col.iloc[0])
+        except Exception:
+            reset_ts = None
+
+    # 2) Parse input dates
+    start_dt = pd.to_datetime(period_start_date).normalize()
+    end_dt = pd.to_datetime(period_end_date).normalize()
+
+    # Guard: if start after end, clamp
+    if start_dt > end_dt:
+        end_dt = start_dt
+
+    # 3) Determine reset boundary date (inclusive window start)
+    if reset_ts is not None:
+        reset_month = int(reset_ts.month)
+        reset_day = int(reset_ts.day)
+        # Construct the reset date in the start year
+        candidate = pd.Timestamp(year=start_dt.year, month=reset_month, day=reset_day)
+        if candidate > start_dt:
+            # If the reset in the same year is after the period start, use previous year
+            candidate = pd.Timestamp(year=start_dt.year - 1, month=reset_month, day=reset_day)
+        window_start = candidate
+    else:
+        # Fallback to Jan 1 of the period start year
+        window_start = pd.Timestamp(year=start_dt.year, month=1, day=1)
+
+    # We sum up to the day before period_start_date
+    window_end = start_dt - pd.Timedelta(days=1)
+
+    # If the computed window is empty or negative, return zeros
+    if window_end < window_start:
+        return 0.0, 0.0
+
+    print(window_start, window_end)
+
+    # 4) Query BI for sums in the window
+    sql = f"""
+        SELECT
+          ROUND(SUM(CASE WHEN row_type = 'O' THEN gmv_eur ELSE 0 END), 2) AS total_gmv_eur,
+          ROUND(SUM(CASE WHEN row_type = 'R' THEN rmv_eur ELSE 0 END), 2) AS total_returns_eur,
+          ROUND(
+            SUM(CASE WHEN row_type = 'O' THEN gmv_eur ELSE 0 END)
+            + SUM(CASE WHEN row_type = 'R' THEN rmv_eur ELSE 0 END),
+          2) AS total_nmv_eur
+        FROM `{BQ_PROJECT}.bi.orders_returns_new`
+        WHERE brand = @brand
+          AND DATE(CASE
+                WHEN row_type = 'O' THEN invoice_creation_date
+                WHEN row_type = 'R' THEN credit_note_creation_date
+              END) BETWEEN @window_start AND @window_end
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("brand", "STRING", brand.strip().upper()),
+            bigquery.ScalarQueryParameter("window_start", "DATE", window_start.strftime("%Y-%m-%d")),
+            bigquery.ScalarQueryParameter("window_end", "DATE", window_end.strftime("%Y-%m-%d")),
+        ]
+    )
+    df = client.query(sql, job_config=job_config).to_dataframe()
+    if df is None or df.empty:
+        return 0.0, 0.0
+    gmv = float(pd.to_numeric(df.iloc[0].get("total_gmv_eur"), errors="coerce") or 0.0)
+    nmv = float(pd.to_numeric(df.iloc[0].get("total_nmv_eur"), errors="coerce") or 0.0)
+    return gmv, nmv
