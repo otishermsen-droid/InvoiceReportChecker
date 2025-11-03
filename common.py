@@ -97,7 +97,7 @@ BRAND_HEADERS: Dict[str, List[str]] = {
         "Qualità Reso."
     ],
     "PJ": [
-        "StoreID", "Export Date", "Transaction ID", "Row ID", "Date",
+        "StoreID", "Export Date", "Transaction ID", "Date", "Row ID",
         "Row Type", "EAN", "Product ID", "Color", "Size", "Qty", "COGS", "Season", "Order Number",
         "Type", "Numero Fattura / Nota di Credito", "Data Fattura", "Shipping Country",
         "Currency", "% Tax", "Original Price", "Sell Price", "Discount", "DDP Services",
@@ -138,6 +138,95 @@ BRAND_HEADERS: Dict[str, List[str]] = {
         "Qualità Reso.","COGS x Qty","Warehouse Location", "Year Month Type"
     ]
 }
+
+"""
+Brand rule declaring whether, on DDP/Tax coexistence, we keep TAX (zero DDP) or keep DDP (zero TAX).
+- Keyed by 2-letter brand code
+"""
+BRAND_TAX_DDP_RULE: Dict[str, str] = {
+    "CV": "DDP",
+    "FE": "TAX",
+    "RC": "TAX",
+    "CA": "TAX",
+    "AL": "DDP",
+    "AT": "DDP",
+    "HB": "TAX",
+    "FO": "DDP",
+    "HE": "DDP",
+    "PJ": "DDP",
+    "MA": "DDP",
+    "PL": "DDP",
+    "BO": "DDP",
+    "MO": "DDP",
+    "FU": "DDP",
+}
+
+def get_brand_rule(brand: Optional[str]) -> Optional[str]:
+    key = (brand or "").strip().upper()
+    rule = BRAND_TAX_DDP_RULE.get(key)
+    rule_norm = str(rule).strip().upper() if rule is not None else None
+    if rule_norm in {"TAX", "DDP"}:
+        return rule_norm
+    return None
+
+def zero_conflicting_fields(
+    df: pd.DataFrame,
+    rule: Optional[str],
+    scope: str = "coexist",
+) -> tuple[pd.DataFrame, int]:
+    """Zero the non-primary field per brand rule.
+
+    - rule == 'TAX': keep Tax, zero DDP Services
+    - rule == 'DDP': keep DDP, zero % Tax / VAT%
+    - scope == 'coexist': only rows where both DDP>0 and Tax>0
+    Returns: (updated_df, rows_affected)
+    """
+    if df is None or df.empty or rule not in {"TAX", "DDP"}:
+        return df, 0
+
+    out = df.copy()
+
+    # Determine columns
+    ddp_col = "DDP Services" if "DDP Services" in out.columns else None
+    tax_primary = "% Tax" if "% Tax" in out.columns else None
+    tax_alt = "VAT%" if "VAT%" in out.columns else None
+
+    if ddp_col is None and (tax_primary is None and tax_alt is None):
+        return out, 0
+
+    # Build numeric series for masking
+    ddp_num = pd.to_numeric(out[ddp_col], errors="coerce") if ddp_col else pd.Series([pd.NA] * len(out), index=out.index)
+    tax_num = None
+    if tax_primary is not None:
+        tax_num = pd.to_numeric(out[tax_primary], errors="coerce")
+    elif tax_alt is not None:
+        tax_num = pd.to_numeric(out[tax_alt], errors="coerce")
+    else:
+        tax_num = pd.Series([pd.NA] * len(out), index=out.index)
+
+    # Coexistence rows mask
+    coexist_mask = (
+        (ddp_num.fillna(0) > 0)
+        & (tax_num.fillna(0) > 0)
+    )
+
+    target_mask = coexist_mask if scope == "coexist" else pd.Series([True] * len(out), index=out.index)
+    rows_affected = int(target_mask.sum())
+    if rows_affected == 0:
+        return out, 0
+
+    if rule == "TAX":
+        # Zero DDP Services
+        if ddp_col is not None:
+            out.loc[target_mask, ddp_col] = 0
+    elif rule == "DDP":
+        # Zero both % Tax and VAT% if present
+        if tax_primary is not None:
+            out.loc[target_mask, tax_primary] = 0
+        if tax_alt is not None:
+            out.loc[target_mask, tax_alt] = 0
+
+    return out, rows_affected
 
 def get_supported_brands() -> List[str]:
     """Return supported brand codes for the dropdown."""
@@ -291,7 +380,7 @@ def load_invoicing_report(file: Union[io.BytesIO, str], brand: Optional[str] = N
 
     # Brand-specific numeric normalization (before coercion)
     brand_key = (brand or "").strip().upper()
-    if brand_key in {"AT", "FO", "AL", "CV"}:
+    if brand_key in {"AT", "FO", "AL", "CV", "RC"}:
         # Legacy normalization kept for specific brands (COGS only)
         if "COGS" in df.columns:
             df["COGS"] = (
@@ -330,6 +419,51 @@ def load_invoicing_report(file: Union[io.BytesIO, str], brand: Optional[str] = N
         # Exchange rate uses a different scaling factor
         if "Exchange rate" in df.columns:
             df["Exchange rate"] = pd.to_numeric(df["Exchange rate"], errors="coerce") / 100000.0
+    
+    # RC-specific enrichment: CODICE BRAND from bi.erp_items.MFVC via Product ID
+    if brand_key == "RC":
+        try:
+            # Always ensure the column exists, even if lookup yields no rows
+            if "CODICE BRAND" not in df.columns:
+                df["CODICE BRAND"] = pd.NA
+            if "Product ID" in df.columns:
+                prod_ids = (
+                    df["Product ID"].astype(str).str.strip()
+                    .dropna().unique().tolist()
+                )
+                if prod_ids:
+                    parts_df = fetch_items_rc_brand_parts(prod_ids)
+                    if not parts_df.empty:
+                        df["__prod_key__"] = df["Product ID"].astype(str).str.strip()
+                        parts_df["__prod_key__"] = parts_df["product_id"].astype(str).str.strip()
+                        # If multiple rows exist for a product, keep only the first
+                        parts_df = parts_df.drop_duplicates(subset=["__prod_key__"], keep="first")
+                        df = df.merge(
+                            parts_df[["__prod_key__", "model", "variant", "fabric", "color"]],
+                            on="__prod_key__",
+                            how="left",
+                        )
+                        # Compose CODICE BRAND as {model}-{variant}-{fabric}{color}
+                        def _compose_brand_code(row: pd.Series) -> Optional[str]:
+                            m = str(row.get("model", "") or "").strip()
+                            v = str(row.get("variant", "") or "").strip()
+                            f = str(row.get("fabric", "") or "").strip()
+                            c = str(row.get("color", "") or "").strip()
+                            if not any([m, v, f, c]):
+                                return None
+                            left = f"{m}-{v}" if m or v else ""
+                            right = f"{f}{c}"
+                            if left and right:
+                                return f"{left}-{right}"
+                            return left or right or None
+                        composed = df.apply(_compose_brand_code, axis=1)
+                        df["CODICE BRAND"] = composed.where(pd.notna(composed) & (composed != ""), df["CODICE BRAND"])  
+                        # Cleanup temp columns
+                        drop_cols = [c for c in ["__prod_key__", "model", "variant", "fabric", "color"] if c in df.columns]
+                        if drop_cols:
+                            df = df.drop(columns=drop_cols)
+        except Exception as e:
+            logging.warning("RC enrichment for CODICE BRAND failed: %s", e)
     return df
 
 # to fix TLG FEE
@@ -439,11 +573,11 @@ def sanity_check_cogs(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.01) 
 
 
 def sanity_checks_ddp_tax(df: pd.DataFrame, tol: float = 0.01) -> pd.DataFrame:
-    # Check if both required columns exist - if not, return empty DataFrame
+    # Only perform check for GB/US shipments; otherwise skip
     if "DDP Services" not in df.columns:
         return pd.DataFrame()
-    
-    # Check for either % Tax or VAT% column
+
+    # Need a tax column and Shipping Country to scope the check
     tax_col = None
     if "% Tax" in df.columns:
         tax_col = "% Tax"
@@ -451,10 +585,19 @@ def sanity_checks_ddp_tax(df: pd.DataFrame, tol: float = 0.01) -> pd.DataFrame:
         tax_col = "VAT%"
     else:
         return pd.DataFrame()
-    
+
+    if "Shipping Country" not in df.columns:
+        return pd.DataFrame()
+
+    # Scope to GB/US shipments only
+    ship_norm = df["Shipping Country"].astype(str).str.strip().str.upper()
+    in_scope = ship_norm.isin(["GB", "US"])
+    if not in_scope.any():
+        return pd.DataFrame()
+
     req = [tax_col, "DDP Services"]
     _coerce_numeric(df, req)
-    mismatches = df[(df[tax_col] > tol) & (df["DDP Services"] > tol)].copy()
+    mismatches = df[in_scope & (df[tax_col] > tol) & (df["DDP Services"] > tol)].copy()
     return mismatches
 
 
@@ -732,6 +875,30 @@ def fetch_items_origin(product_ids: List[str]) -> pd.DataFrame:
         SELECT DISTINCT
           CAST(product_id AS STRING) AS product_id,
           CAST(made_in AS STRING)    AS made_in
+        FROM `{BQ_PROJECT}.bi.erp_items`
+        WHERE CAST(product_id AS STRING) IN UNNEST(@ids)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("ids", "STRING", [str(x) for x in product_ids])
+        ]
+    )
+    return client.query(sql, job_config=job_config).to_dataframe()
+
+
+def fetch_items_rc_brand_parts(product_ids: List[str]) -> pd.DataFrame:
+    """
+    Fetch `product_id`, `model`, `variant`, `fabric`, `color` from `bi.erp_items` for provided IDs.
+    """
+    if not product_ids:
+        return pd.DataFrame(columns=["product_id", "model", "variant", "fabric", "color"])
+    sql = f"""
+        SELECT DISTINCT
+          CAST(product_id AS STRING) AS product_id,
+          CAST(model       AS STRING) AS model,
+          CAST(variant     AS STRING) AS variant,
+          CAST(fabric      AS STRING) AS fabric,
+          CAST(color       AS STRING) AS color
         FROM `{BQ_PROJECT}.bi.erp_items`
         WHERE CAST(product_id AS STRING) IN UNNEST(@ids)
     """
@@ -1225,18 +1392,23 @@ def apply_tlg_fee_config_per_row(
             elif pd.notna(qty_val) and float(qty_val) < 0:
                 is_return = True
 
-            if is_return:
-                applied_fee = 0.0 if applied_fee is not None else 0.0
+            # Determine calc base once
+            if selected_row is not None:
+                calc_base = str(selected_row.get("fee_calc_base") or "").strip().upper()
             else:
-                # Only gate on Qualità Reso. when fee_calc_base is NMV
-                if selected_row is not None:
-                    calc_base = str(selected_row.get("fee_calc_base") or "").strip().upper()
-                else:
-                    calc_base = ""
+                calc_base = ""
 
+            if is_return:
+                # Returns: apply fee only when base is NMV; zero out for GMV
+                if calc_base == "GMV":
+                    applied_fee = 0.0 if applied_fee is not None else 0.0
+                else:
+                    # NMV (or unknown): keep applied_fee as-is so returns are charged too
+                    pass
+            else:
+                # Orders: for NMV, apply gating on Qualità Reso. (fee only when equals 0)
                 if calc_base == "NMV":
                     qreso = pd.to_numeric(row.get("Qualità Reso."), errors="coerce") if "Qualità Reso." in row.index else 0.0
-                    # Apply the TLG fee only if Qualità Reso. equals 0
                     if pd.notna(qreso) and float(qreso) != 0.0:
                         applied_fee = 0.0 if applied_fee is not None else 0.0
 

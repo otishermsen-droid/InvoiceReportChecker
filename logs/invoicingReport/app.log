@@ -107,3 +107,18 @@ tornado.websocket.WebSocketClosedError
 2025-10-20 18:36:47,698 - INFO: Loading all indices.
 2025-10-20 18:36:59,473 - INFO: HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
 2025-10-20 18:37:00,379 - INFO: HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-10-29 16:06:12,394 - WARNING: RC enrichment for CODICE BRAND failed: 400 Unrecognized name: MFVC at [4:16]; reason: invalidQuery, location: query, message: Unrecognized name: MFVC at [4:16]
+
+Location: europe-west1
+Job ID: 96a7f8e2-9d3f-4fa5-aaa7-c80e77ee2f45
+
+2025-10-29 16:07:05,385 - WARNING: RC enrichment for CODICE BRAND failed: 400 Unrecognized name: MFVC at [4:16]; reason: invalidQuery, location: query, message: Unrecognized name: MFVC at [4:16]
+
+Location: europe-west1
+Job ID: 224c9691-5b2e-425c-95ed-b0b431fd6654
+
+2025-10-29 16:15:06,253 - WARNING: RC enrichment for CODICE BRAND failed: 400 Unrecognized name: MFVC at [4:16]; reason: invalidQuery, location: query, message: Unrecognized name: MFVC at [4:16]
+
+Location: europe-west1
+Job ID: 29b333ed-a926-4122-a038-aa608f253c8d
+

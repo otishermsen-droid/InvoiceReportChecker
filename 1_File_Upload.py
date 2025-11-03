@@ -106,6 +106,9 @@ if uploaded_file is not None and brand:
                 initial_gmv = float(gmv_val or 0.0)
                 initial_nmv = float(nmv_val or 0.0)
                 print(initial_gmv, initial_nmv)
+                # Persist for downstream display
+                st.session_state.initial_gmv = initial_gmv
+                st.session_state.initial_nmv = initial_nmv
         except Exception:
             pass
 

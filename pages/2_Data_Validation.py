@@ -15,6 +15,8 @@ from common import (
     fetch_ytd_totals_until_date,
     fetch_reset_aware_totals,
     sanity_check_original_price_value,
+    get_brand_rule,
+    zero_conflicting_fields,
 )
 
 st.set_page_config(page_title="File Data Validation", layout="wide")
@@ -147,6 +149,31 @@ ddp_display = ddp_tax_mism[[
 
 if not ddp_display.empty:
     st.dataframe(ddp_display.head(50), width='stretch')
+
+# Brand rule note and auto-fix for DDP/Tax coexistence
+brand_rule = get_brand_rule(brand)
+if brand_rule in {"TAX", "DDP"}:
+    if brand_rule == "TAX":
+        st.caption("Brand rule: TAX — keep %Tax/VAT, zero DDP Services on coexistence rows.")
+    else:
+        st.caption("Brand rule: DDP — keep DDP Services, zero %Tax/VAT on coexistence rows.")
+
+    ddp_tax_autofix_btn = st.button(
+        "Auto-fix DDP/Tax by brand rule",
+        type="primary",
+        use_container_width=True,
+    )
+    if ddp_tax_autofix_btn:
+        try:
+            updated_df, affected = zero_conflicting_fields(st.session_state.df.copy(), rule=brand_rule, scope="coexist")
+            st.session_state.df = updated_df
+            if affected:
+                st.success(f"Auto-fixed {affected} row(s) based on brand rule {brand_rule}.")
+            else:
+                st.info("No coexistence rows to fix for this brand rule.")
+            st.rerun()
+        except Exception as e:
+            st.warning(f"DDP/Tax auto-fix failed: {e}")
 
 if brand != "FE":
     # ────────────────────────────────────────────────────────────────────────────
@@ -309,7 +336,8 @@ If they differ beyond tolerance, the row is flagged. Auto-fix sets `Discount Val
         if has_cols and ret_mask.any():
             sub = df.loc[ret_mask, [c for c in ["Order Number", "Product ID", "Discount Value", "discount"] if c in df.columns]].copy()
             sub["Discount Value"] = pd.to_numeric(sub["Discount Value"], errors="coerce")
-            sub["discount"] = pd.to_numeric(sub["discount"], errors="coerce")
+            # Use absolute BI discount for comparison and fixing
+            sub["discount"] = pd.to_numeric(sub["discount"], errors="coerce").abs().round(2)
             sub["delta"] = (sub["Discount Value"].fillna(0) - sub["discount"].fillna(0)).round(2)
             discount_mism = sub[(sub["delta"].abs() > 0.01)]
 
@@ -488,6 +516,13 @@ tlg_cols = [
 ]
 tlg_display = tlg_fee_mism[[
     c for c in tlg_cols if c in tlg_fee_mism.columns]]
+
+
+init_gmv = st.session_state.get("initial_gmv")
+init_nmv = st.session_state.get("initial_nmv")
+st.markdown(f"**Sum GMV used for TLG FEE calculation:** {init_gmv:,.2f}")
+st.markdown(f"**Sum NMV used for TLG FEE calculation:** {init_nmv:,.2f}")
+
 
 st.markdown(
     f"**{'PASSED ✅' if len(tlg_fee_mism) == 0 else 'NOT PASSED ❌'}**")

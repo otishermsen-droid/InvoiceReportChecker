@@ -42,7 +42,15 @@ st.dataframe(df.head(100))
 st.markdown("---")
 st.markdown("## Download")
 
-csv_bytes = df.to_csv(index=False).encode("utf-8")
+# Export with EU-friendly formatting: semicolon separator and comma decimals
+csv_text = df.to_csv(
+    index=False,
+    sep=";",
+    decimal=",",
+    na_rep="",
+    float_format="%.2f",
+)
+csv_bytes = csv_text.encode("utf-8")
 st.download_button(
     label="⬇️ Download CSV",
     data=csv_bytes,
