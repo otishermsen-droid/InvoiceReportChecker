@@ -41,8 +41,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Sidebar elements removed per requirements
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Require data in session (no upload here) and apply single TLG fee
 # ────────────────────────────────────────────────────────────────────────────────
@@ -185,7 +183,7 @@ if brand != "FE":
             """
 **GMV Calculation:**  
 GMV is checked as:  
-`GMV EUR ≈ Sell Price - Discount - DDP Services`  
+`GMV EUR ≈ (Sell Price - Discount - DDP Services) / Exchange rate`  
 Rows are flagged if the calculated GMV does not match the expected value.
 """,
             icon="ℹ️",
@@ -202,6 +200,8 @@ Rows are flagged if the calculated GMV does not match the expected value.
         "expected_gmv",
         "delta",
     ]
+    # with pd.option_context('display.max_columns', None):
+        # print(df[df['Order Number'] == 'HE-EU-00118767'])
     gmv_display = gmv_eur_mism[[c for c in gmv_cols if c in gmv_eur_mism.columns]]
     if not gmv_display.empty:
         st.dataframe(gmv_display.head(50), width='stretch')

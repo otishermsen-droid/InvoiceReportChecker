@@ -15,7 +15,7 @@ df = st.session_state.df.copy()
 brand = st.session_state.get("brand")
 if isinstance(brand, str) and brand.strip().upper() == "HE":
     he_cols = [
-        "Qty", "% Tax", "Original Price", "Sell Price", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2", "COGS x Qty"
+        "Qty", "% Tax", "Original Price", "Sell Price", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS", "COGS2", "COGS x Qty", "DDP Services", "Qualità Reso."
     ]
     for c in he_cols:
         if c in df.columns:
@@ -35,6 +35,14 @@ columns_to_remove = ["recalc_%TLG FEE"]
 for col in columns_to_remove:
     if col in df.columns:
         df = df.drop(columns=[col])
+
+# For standard brands (non-FE), export dates as YYYYMMDD (e.g., 20251106)
+brand_key = (brand or "").strip().upper() if isinstance(brand, str) else ""
+if brand_key != "FE":
+    for c in ["Export Date", "Date"]:
+        if c in df.columns:
+            ser = pd.to_datetime(df[c], errors="coerce")
+            df[c] = ser.dt.strftime("%Y%m%d").fillna("")
 
 st.markdown("## Preview Updated DataFrame")
 st.dataframe(df.head(100))

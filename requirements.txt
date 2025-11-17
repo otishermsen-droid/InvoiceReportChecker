@@ -1,10 +1,6 @@
 streamlit>=1.31
 pandas
 google-cloud-bigquery
-llama-index-core
-llama-index-llms-openai
-llama-index-embeddings-openai
 plotly
 numpy
-llama_index.agent.openai
 db-dtypes

@@ -24,7 +24,6 @@ from typing import Optional, Any, Iterable
 import pandas as pd
 import numpy as np
 
-
 # =====================
 # Setup & configuration
 # =====================
@@ -49,7 +48,6 @@ credentials = service_account.Credentials.from_service_account_info(
     st.secrets["gcp_service_account"]
 )
 client = bigquery.Client(credentials=credentials)
-
 
 """
 Brand-specific CSV header arrays
@@ -179,6 +177,7 @@ def zero_conflicting_fields(
     - rule == 'TAX': keep Tax, zero DDP Services
     - rule == 'DDP': keep DDP, zero % Tax / VAT%
     - scope == 'coexist': only rows where both DDP>0 and Tax>0
+    - Special case: RC on GB -> enforce 20% Tax, not DDP
     Returns: (updated_df, rows_affected)
     """
     if df is None or df.empty or rule not in {"TAX", "DDP"}:
@@ -219,6 +218,20 @@ def zero_conflicting_fields(
         # Zero DDP Services
         if ddp_col is not None:
             out.loc[target_mask, ddp_col] = 0
+        # Special rule: RC brand on GB uses 20% Tax
+        try:
+            brand_key = (st.session_state.get("brand") or "").strip().upper()
+        except Exception:
+            brand_key = ""
+        if brand_key == "RC" and "Shipping Country" in out.columns:
+            ship_norm = out["Shipping Country"].astype(str).str.strip().str.upper()
+            rc_gb_mask = target_mask & (ship_norm == "GB")
+            if rc_gb_mask.any():
+                # Set Tax to 20% where applicable; leave NaNs in rows without the column(s)
+                if tax_primary is not None:
+                    out.loc[rc_gb_mask, tax_primary] = 20
+                if tax_alt is not None:
+                    out.loc[rc_gb_mask, tax_alt] = 20
     elif rule == "DDP":
         # Zero both % Tax and VAT% if present
         if tax_primary is not None:
@@ -404,14 +417,14 @@ def load_invoicing_report(file: Union[io.BytesIO, str], brand: Optional[str] = N
 
     num_cols = [
         "Qty", "COGS", "% Tax", "VAT%", "Original Price", "Original Price Value", "Sales Tax", "Discount Value", "Sell Price", "Discount", "DDP Services",
-        "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2"
+        "Exchange rate", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2", "COGS x Qty"
     ]
     df = _coerce_numeric(df, num_cols)
 
     # HE-specific: scale selected columns by dividing by 100 for internal use
     if brand_key == "HE":
         he_cols = [
-            "Qty", "% Tax", "Original Price", "Sell Price", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS2", "COGS x Qty"
+            "Qty", "% Tax", "Original Price", "Sell Price", "GMV EUR", "GMV Net VAT", "% TLG FEE", "TLG Fee", "COGS", "COGS2", "COGS x Qty", "DDP Services", "Qualità Reso."
         ]
         for c in he_cols:
             if c in df.columns:
@@ -699,11 +712,10 @@ def sanity_check_gmv_net(df: pd.DataFrame, atol: float = 0.01, rtol: float = 0.0
     except Exception:
         brand_key = None
     he_decimal_mode = isinstance(brand_key, str) and brand_key.strip().upper() == "HE"
-    if not he_decimal_mode:
-        percent = percent
-    else:
-        # already decimal, no conversion
-        pass
+    # Robustness: Some HE files may still carry percent values like 22 instead of 0.22.
+    # If so, convert values > 1 to decimals by dividing by 100.
+    if he_decimal_mode:
+        percent = percent.where(percent <= 1, percent / 100)
     # If HE: percent is decimal; otherwise convert from percentage
     divisor = (1 + (percent if he_decimal_mode else (percent / 100)))
     df["expected_gmv_net"] = df["GMV EUR"] / divisor

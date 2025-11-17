@@ -342,14 +342,39 @@ with ddp_col1:
 if ddp_clicked:
     try:
         with st.spinner("Resolving brand code and fetching DDP configuration..."):
-            from common import fetch_brand_code, fetch_ddp_config, fetch_items_origin
+            from common import fetch_brand_code, fetch_items_origin, client
+            from google.cloud import bigquery
 
             # 1) Resolve brand_code from config.brand
             brand_code = fetch_brand_code(brand) or brand  # fallback to input if not found
             st.session_state.ddp_brand_code = brand_code
 
-            # 2) Fetch DDP config for brand_code + ERP Entity (source_company)
-            ddp_cfg = fetch_ddp_config(brand_code=brand_code, source_company=erpEntity)
+            # 2) Fetch DDP config from config.invoice_checker_duties_config for brand_code + ERP Entity (US only)
+            sql = """
+                SELECT
+                  brand_code,
+                  shipping_country,
+                  oms_location_name,
+                  duty_recalculation,
+                  ddp_fix,
+                  ddp_perc,
+                  treshold_amount,
+                  currency_code,
+                  application_date,
+                  origin_country,
+                  source_company
+                FROM `tlg-business-intelligence-prd.config.invoice_checker_duties_config`
+                WHERE UPPER(TRIM(brand_code)) = UPPER(@brand_code)
+                  AND UPPER(TRIM(source_company)) = UPPER(@source_company)
+                  AND UPPER(TRIM(shipping_country)) = 'US'
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("brand_code", "STRING", brand_code),
+                    bigquery.ScalarQueryParameter("source_company", "STRING", erpEntity),
+                ]
+            )
+            ddp_cfg = client.query(sql, job_config=job_config).to_dataframe()
             if ddp_cfg.empty:
                 st.warning("No DDP config rows found for this Brand/ERP Entity.")
             st.session_state.ddp_config = ddp_cfg
