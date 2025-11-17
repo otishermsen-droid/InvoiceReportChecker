@@ -10,6 +10,30 @@ import pandas as pd
 st.set_page_config(page_title="BQ Cross Check", layout="wide")
 st.title("📊 BQ Cross Check")
 
+# Style primary buttons (e.g., Auto-fix) as green
+st.markdown("""
+<style>
+[data-testid="baseButton-primary"] {
+    background-color: #28a745 !important;
+    color: white !important;
+    border: none !important;
+}
+[data-testid="baseButton-primary"]:hover {
+    background-color: #218838 !important;
+    color: white !important;
+}
+.stButton > button[kind="primary"] {
+    background-color: #28a745 !important;
+    color: white !important;
+    border: none !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background-color: #218838 !important;
+    color: white !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Check if data is available
 if "df" not in st.session_state or st.session_state.df is None:
     st.warning(
@@ -17,6 +41,14 @@ if "df" not in st.session_state or st.session_state.df is None:
     st.stop()
 else:
     csv_df = st.session_state.df.copy()
+    # Show post-action feedback if any
+    if "ddp_fix_feedback" in st.session_state and st.session_state.ddp_fix_feedback:
+        try:
+            rows_fixed = int(st.session_state.ddp_fix_feedback.get("rows", 0))
+        except Exception:
+            rows_fixed = 0
+        st.success(f"Auto-fixed {rows_fixed:,} line(s). CSV reloaded with updated DDP Services.")
+        st.session_state.ddp_fix_feedback = None
 
 
 # Sidebar for BigQuery configuration (header only, settings removed)
@@ -337,7 +369,13 @@ st.markdown("### 🗽 US Duties Check")
 
 ddp_col1, ddp_col2 = st.columns([1, 3])
 with ddp_col1:
-    ddp_clicked = st.button("🔎 Fetch DDP Config & Origins", width='stretch')
+    # Allow programmatic trigger after auto-fix by checking a session flag
+    force_fetch = False
+    try:
+        force_fetch = bool(st.session_state.pop("ddp_clicked_force"))
+    except Exception:
+        force_fetch = False
+    ddp_clicked = st.button("🔎 Fetch DDP Config & Origins", width='stretch', key="ddp_fetch_btn") or force_fetch
 
 if ddp_clicked:
     try:
@@ -512,6 +550,51 @@ if (
     st.markdown("#### Lines with DDP mismatch (|Δ| > 0.01)")
     st.caption(f"{len(mismatch_tbl):,} line(s)")
     st.dataframe(mismatch_tbl.head(2000), width='stretch', height=360)
+
+    # Auto-fix button: update CSV "DDP Services" with recalculated values
+    fix_ddp_btn = st.button(
+        "Auto-fix DDP Services with recalculated duties",
+        type="primary",
+        disabled=mismatch_tbl.empty,
+        use_container_width=True,
+    )
+    if fix_ddp_btn and not mismatch_tbl.empty:
+        try:
+            updated = st.session_state.df.copy()
+            # Build robust join keys (order + product)
+            if "Order Number" in updated.columns and prod_col in updated.columns:
+                upd_keys = pd.DataFrame({
+                    "__order_key__": updated["Order Number"].astype(str).str.strip().str.upper(),
+                    "__prod_key__": updated[prod_col].astype(str).str.strip().str.upper(),
+                })
+                # Prepare mapping from mismatches
+                mis = mismatch_tbl.copy()
+                mis["__order_key__"] = mis.get("Order Number", "").astype(str).str.strip().str.upper()
+                mis["__prod_key__"] = mis.get(prod_col, "").astype(str).str.strip().str.upper()
+                mis = mis.dropna(subset=["__order_key__", "__prod_key__"])
+                # Deduplicate on keys, keep first occurrence
+                mis_map = (
+                    mis[["__order_key__", "__prod_key__", "ddp_recalc"]]
+                    .drop_duplicates(subset=["__order_key__", "__prod_key__"], keep="first")
+                )
+                # Join indices to update
+                idx = upd_keys.merge(mis_map, on=["__order_key__", "__prod_key__"], how="left").index
+                ddp_vals = upd_keys.merge(mis_map, on=["__order_key__", "__prod_key__"], how="left")["ddp_recalc"]
+                mask = ddp_vals.notna()
+                to_update_idx = idx[mask]
+                if len(to_update_idx) > 0 and "DDP Services" in updated.columns:
+                    updated.loc[to_update_idx, "DDP Services"] = pd.to_numeric(ddp_vals[mask], errors="coerce").values
+                    # Apply fix, keep the in-memory CSV, and refresh the page
+                    st.session_state.df = updated
+                    # Trigger a fresh fetch of DDP Config & Origins to refresh previews
+                    st.session_state.ddp_clicked_force = True
+                    st.rerun()
+                else:
+                    st.info("No applicable rows found to update in the CSV.")
+            else:
+                st.warning(f"Missing columns to apply fix: 'Order Number' and '{prod_col}'.")
+        except Exception as e:
+            st.warning(f"DDP auto-fix failed: {e}")
 
     # Persist for downstream use / export
     st.session_state.ddp_recalc_frame = staged
