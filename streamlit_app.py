@@ -6,8 +6,8 @@ import streamlit as st
 pages = {
     "Invoice Checker": [
         st.Page("1_File_Upload.py", title="File Upload", icon="📥"),
-        st.Page("pages/2_Data_Validation.py", title="File Data Validation", icon="📄"),
         st.Page("pages/4_BI_Cross_Check.py", title="BQ Cross Check", icon="📊"),
+        st.Page("pages/2_Data_Validation.py", title="File Data Validation", icon="📄"),
         st.Page("pages/5_Export_Data.py", title="Export Updated Data", icon="📤"),
     ],
     "Configuration": [
