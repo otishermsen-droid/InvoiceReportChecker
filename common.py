@@ -393,7 +393,7 @@ def load_invoicing_report(file: Union[io.BytesIO, str], brand: Optional[str] = N
 
     # Brand-specific numeric normalization (before coercion)
     brand_key = (brand or "").strip().upper()
-    if brand_key in {"AT", "FO", "AL", "CV", "RC"}:
+    if brand_key in {"AT", "FO", "AL", "CV", "RC", "BO", "PJ"}:
         # Legacy normalization kept for specific brands (COGS only)
         if "COGS" in df.columns:
             df["COGS"] = (
